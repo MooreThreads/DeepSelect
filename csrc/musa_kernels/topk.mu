@@ -1617,14 +1617,16 @@ __device__ __forceinline__ bool fp32_sample_prefix_matches(
   }
 }
 
-template <int kByte, bool kCheckNan>
+template <int kByte, bool kCheckNan, bool kClearHistogram = true>
 __device__ __forceinline__ void fp32_sample_radix_pass(
     const float* values, int count, int* histogram, int* thresholds,
     int* remain, int* nan_count, int first_wanted) {
   const int tid = static_cast<int>(threadIdx.x);
   const int threads = static_cast<int>(blockDim.x);
-  for (int bin = tid; bin < 256; bin += threads) histogram[bin] = 0;
-  __syncthreads();
+  if constexpr (kClearHistogram) {
+    for (int bin = tid; bin < 256; bin += threads) histogram[bin] = 0;
+    __syncthreads();
+  }
   for (int position = tid; position < count; position += threads) {
     const float value = values[position];
     if constexpr (kCheckNan) {
@@ -2192,6 +2194,326 @@ bool launch_topk_fp32_typed(
         input_ptr, output_ptr, width, input_stride, output_stride, values,
         value_stride, end_ptr, idx_fill, value_fill, topk, return_value);
   return false;
+}
+
+constexpr int kTwoStageThreads = 256;
+constexpr int kTwoStageSamples = 2048;
+constexpr int kTwoStageCapacity = 768;
+constexpr int kTwoStageMaxParts = 16;
+constexpr int kTwoStageMaxTopK = 2048;
+constexpr int kTwoStageWords = 3 + 3 * kTwoStageCapacity;
+
+template <int kSamples>
+__global__ void topk_fp32_scan_partitions(
+    const float* input, int width, int64_t stride, int topk, int* workspace) {
+  const int tid = threadIdx.x;
+  const float* row = input + blockIdx.y * stride;
+  int* part = workspace + (blockIdx.y * gridDim.x + blockIdx.x) * kTwoStageWords;
+  __shared__ float sample[kSamples];
+  __shared__ int hist[kRadix], thresholds[4], remain, counts[3];
+  if (tid < 3) counts[tid] = 0;
+  for (int i = tid; i < kSamples; i += blockDim.x) {
+    const int lo = static_cast<int64_t>(i) * width / kSamples;
+    if constexpr (kSamples == kTwoStageSamples) {
+      sample[i] = row[lo];
+    } else {
+      const int hi = static_cast<int64_t>(i + 1) * width / kSamples;
+      const uint32_t h = static_cast<uint32_t>(i) * 0x9e3779b9u;
+      const int offset = static_cast<uint64_t>(h ^ (h >> 16)) * (hi - lo) >> 32;
+      sample[i] = row[lo + offset];
+    }
+  }
+  __syncthreads();
+
+  const float mean = static_cast<float>(topk * kSamples) / width;
+  const int rank = min(kSamples, max(1, static_cast<int>(mean + (kSamples == kTwoStageSamples ? 2.5f : 3.5f) * sqrtf(mean + 1)) + 2));
+  fp32_sample_radix_pass<3, false, true>(sample, kSamples, hist, thresholds, &remain, nullptr, rank);
+  fp32_sample_radix_pass<2, false, false>(sample, kSamples, hist, thresholds, &remain, nullptr, rank);
+  fp32_sample_radix_pass<1, false, false>(sample, kSamples, hist, thresholds, &remain, nullptr, rank);
+  fp32_sample_radix_pass<0, false, false>(sample, kSamples, hist, thresholds, &remain, nullptr, rank);
+  const uint32_t pivot = (static_cast<uint32_t>(thresholds[3]) << 24) |
+      (thresholds[2] << 16) | (thresholds[1] << 8) | thresholds[0];
+
+  const uint32_t lanes_before = (1u << (tid & 31)) - 1;
+  const auto reserve = [&](uint32_t mask, int* count) {
+    int base = 0;
+    if ((tid & 31) == 0) base = atomicAdd(count, __popc(mask));
+    return __shfl_sync(0xffffffffu, base, 0) + __popc(mask & lanes_before);
+  };
+  const auto collect = [&](int col, uint32_t key, bool valid) {
+    const bool nan = valid && (key > 0xff800000u || key < 0x007fffffu);
+    const bool strict = valid && !nan && key > pivot;
+    const bool equal = valid && key == pivot;
+    if (nan) atomicOr(counts + 2, 1);
+
+    const bool prechecked = kSamples != kTwoStageSamples;
+    const uint32_t hits = __ballot_sync(0xffffffffu, prechecked ? strict || equal : strict);
+    if (prechecked && !hits) return;
+    const uint32_t equal_mask = __ballot_sync(0xffffffffu, equal);
+    const uint32_t strict_mask = prechecked ? hits & ~equal_mask : hits;
+    if (strict_mask) {
+      const int pos = reserve(strict_mask, counts);
+      if (strict && pos < kTwoStageCapacity) {
+        part[3 + pos] = col;
+        reinterpret_cast<uint32_t*>(part)[3 + kTwoStageCapacity + pos] = key;
+      }
+    }
+    if (equal_mask) {
+      const int pos = reserve(equal_mask, counts + 1);
+      if (equal && pos < kTwoStageCapacity) part[3 + 2 * kTwoStageCapacity + pos] = col;
+    }
+  };
+  const int vecs = width / 4;
+  const int begin = vecs * blockIdx.x / gridDim.x;
+  const int end = vecs * (blockIdx.x + 1) / gridDim.x;
+  const bool aligned = (reinterpret_cast<uintptr_t>(row) & 15) == 0;
+  for (int base = begin; base < end; base += blockDim.x) {
+    const int i = base + tid;
+    Floatx4 v{};
+    if (i < end) {
+      if (aligned) v = load_floatx4(row + 4 * i);
+      else for (int j = 0; j < 4; ++j) v.values[j] = row[4 * i + j];
+    }
+    uint32_t keys[4];
+    bool any = false;
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      keys[j] = ordered_key(v.values[j]);
+      any |= keys[j] >= pivot || keys[j] > 0xff800000u || keys[j] < 0x007fffffu;
+    }
+    if (kSamples == kTwoStageSamples || __ballot_sync(0xffffffffu, i < end && any)) {
+      #pragma unroll
+      for (int j = 0; j < 4; ++j) collect(4 * i + j, keys[j], i < end);
+    }
+  }
+  if (blockIdx.x == gridDim.x - 1 && width % 4 != 0) {
+    const int i = 4 * vecs + tid;
+    collect(i, ordered_key(i < width ? row[i] : 0.0f), i < width);
+  }
+  __syncthreads();
+  if (tid < 3) part[tid] = counts[tid];
+}
+
+template <typename OutIndexT, int kFinishCapacity, bool kDeferFallback>
+__global__ void topk_fp32_finish_partitions(
+    const float* input, int width, int64_t stride, OutIndexT* output,
+    int64_t output_stride, float* values, int64_t value_stride, int topk,
+    bool sort_by_value, const int* workspace, int parts) {
+  const int tid = threadIdx.x;
+  const float* row = input + blockIdx.x * stride;
+  OutIndexT* indices = output + blockIdx.x * output_stride;
+  float* row_values = values ? values + blockIdx.x * value_stride : nullptr;
+  const int* row_ws = workspace + blockIdx.x * parts * kTwoStageWords;
+  __shared__ int offsets[kTwoStageMaxParts + 1], eq_offsets[kTwoStageMaxParts + 1];
+  __shared__ int exact_full, fill_ties, has_nan;
+  __shared__ int hist[3 * kValueSortFastMax + 3 * kValueSortBuckets + 3];
+  __shared__ int thresholds[4], remain, output_count;
+  __shared__ uint32_t keys[kFinishCapacity];
+  __shared__ int cols[kFinishCapacity];
+  if (tid == 0) {
+    offsets[0] = eq_offsets[0] = 0;
+    exact_full = has_nan = output_count = 0;
+    for (int p = 0; p < parts; ++p) {
+      const int* part = row_ws + p * kTwoStageWords;
+      exact_full |= part[0] > kTwoStageCapacity;
+      has_nan |= part[2];
+      offsets[p + 1] = offsets[p] + min(part[0], kTwoStageCapacity);
+      eq_offsets[p + 1] = eq_offsets[p] + min(part[1], kTwoStageCapacity);
+    }
+    const int strict = offsets[parts];
+    exact_full |= has_nan || strict > kFinishCapacity ||
+                  strict + eq_offsets[parts] < topk;
+    fill_ties = !exact_full && strict <= topk;
+  }
+  __syncthreads();
+
+  if constexpr (kDeferFallback) {
+    if (exact_full) {
+      if (tid == 0) indices[0] = static_cast<OutIndexT>(kSampleFallbackSentinel);
+      return;
+    }
+  }
+
+  const int count = exact_full ? width : offsets[parts];
+  const auto candidate_col = [&](int i, bool equal) {
+    const int* cut = equal ? eq_offsets : offsets;
+    int p = 0;
+    while (i >= cut[p + 1]) ++p;
+    return row_ws[p * kTwoStageWords + 3 + (equal ? 2 * kTwoStageCapacity : 0) + i - cut[p]];
+  };
+
+  if (fill_ties) {
+    for (int i = tid; i < topk; i += blockDim.x) {
+      const int col = i < count ? candidate_col(i, false) : candidate_col(i - count, true);
+      store_topk_result(indices, row_values, values != nullptr, i, col, row[col]);
+    }
+  } else {
+    if (!exact_full) {
+      for (int p = 0; p < parts; ++p) {
+        const int* part = row_ws + p * kTwoStageWords;
+        for (int i = offsets[p] + tid; i < offsets[p + 1]; i += blockDim.x) {
+          const int slot = i - offsets[p];
+          cols[i] = part[3 + slot];
+          keys[i] = reinterpret_cast<const uint32_t*>(part)[3 + kTwoStageCapacity + slot];
+        }
+      }
+      __syncthreads();
+    }
+    uint32_t prefix = 0;
+    uint32_t mask = 0;
+    for (int byte = 3; byte >= 0; --byte) {
+      hist[tid] = 0;
+      __syncthreads();
+      for (int i = tid; i < count; i += blockDim.x) {
+        const uint32_t key = exact_full ? ordered_key(row[i]) : keys[i];
+        if ((key & mask) == prefix) atomicAdd(hist + ((key >> (8 * byte)) & 255), 1);
+      }
+      __syncthreads();
+      warp_select(hist, byte == 3 ? topk : remain, thresholds + byte, &remain);
+      __syncthreads();
+      const uint32_t byte_mask = 255u << (8 * byte);
+      mask |= byte_mask;
+      prefix |= static_cast<uint32_t>(thresholds[byte]) << (8 * byte);
+    }
+    const int rounds = (count + blockDim.x - 1) / blockDim.x;
+    const uint32_t lanes_before = (1u << (tid & 31)) - 1;
+    for (int round = 0; round < rounds; ++round) {
+      const int i = round * blockDim.x + tid;
+      const bool valid = i < count;
+      const int col = exact_full ? i : (valid ? cols[i] : 0);
+      const uint32_t key = valid ? (exact_full ? ordered_key(row[col]) : keys[i]) : 0;
+      const float v = value_from_ordered_key(key);
+      const uint32_t strict_mask = __ballot_sync(0xffffffffu, valid && key > prefix);
+      if (strict_mask) {
+        int base = 0;
+        if ((tid & 31) == 0) base = atomicAdd(&output_count, __popc(strict_mask));
+        const int pos = __shfl_sync(0xffffffffu, base, 0) + __popc(strict_mask & lanes_before);
+        if (valid && key > prefix) store_topk_result(indices, row_values, values != nullptr, pos, col, v);
+      }
+      const uint32_t equal_mask = __ballot_sync(0xffffffffu, valid && key == prefix);
+      if (equal_mask) {
+        int left = 0;
+        if ((tid & 31) == 0) left = atomicAdd(&remain, -__popc(equal_mask));
+        left = __shfl_sync(0xffffffffu, left, 0);
+        if (valid && key == prefix) {
+          const int pos = topk - left + __popc(equal_mask & lanes_before);
+          if (pos < topk) store_topk_result(indices, row_values, values != nullptr, pos, col, v);
+        }
+      }
+    }
+  }
+  __syncthreads();
+  if (has_nan) {
+    if (tid == 0) indices[0] = static_cast<OutIndexT>(kNanSentinel);
+  } else if (sort_by_value) {
+    sort_selected_row_by_value_impl<OutIndexT, true>(indices, row_values, topk, topk, hist);
+  }
+}
+
+int64_t two_stage_scratch_ints(int64_t rows, int64_t parts) {
+  TORCH_CHECK(rows > 0 && rows <= 65535 && parts >= 1 && parts <= kTwoStageMaxParts,
+              "invalid two-stage grid");
+  return rows * parts * kTwoStageWords;
+}
+
+template <typename OutIndexT, int kCapacity, bool kDeferFallback>
+void launch_finish_partitions(
+    const at::Tensor& input, at::Tensor& output, float* values,
+    int64_t value_stride, bool sort_by_value, bool abort_when_nan_found,
+    const int* workspace, int parts, musaStream_t stream) {
+  auto* indices = output.data_ptr<OutIndexT>();
+  const int rows = input.size(0);
+  const int topk = output.size(1);
+  topk_fp32_finish_partitions<OutIndexT, kCapacity, kDeferFallback>
+      <<<rows, kTwoStageThreads, 0, stream>>>(
+          input.data_ptr<float>(), input.size(1), input.stride(0), indices,
+          output.stride(0), values, value_stride, topk, sort_by_value,
+          workspace, parts);
+  if constexpr (kDeferFallback) {
+    topk_fp32_compact12_kernel<1024, 4096, OutIndexT, false, true>
+        <<<rows, 1024, 0, stream>>>(
+            input.data_ptr<float>(), indices, input.size(1), input.stride(0),
+            output.stride(0), values, value_stride, nullptr, OutIndexT{0}, 0.0f,
+            topk, values != nullptr, sort_by_value);
+  }
+  if (abort_when_nan_found) launch_nan_guard(indices, rows, output.stride(0), stream);
+}
+
+template <typename OutIndexT, int kSamples, int kCapacity>
+void launch_two_stage_partitions(
+    const at::Tensor& input, at::Tensor& output, float* values,
+    int64_t value_stride, bool sort_by_value, bool abort_when_nan_found,
+    int* workspace, int parts, musaStream_t stream) {
+  const dim3 grid(parts, input.size(0));
+  topk_fp32_scan_partitions<kSamples><<<grid, kTwoStageThreads, 0, stream>>>(
+      input.data_ptr<float>(), input.size(1), input.stride(0), output.size(1),
+      workspace);
+  launch_finish_partitions<OutIndexT, kCapacity, kSamples != kTwoStageSamples>(
+      input, output, values, value_stride, sort_by_value, abort_when_nan_found,
+      workspace, parts, stream);
+}
+
+template <typename OutIndexT>
+void dispatch_two_stage_partitions(
+    const at::Tensor& input, at::Tensor& output, float* values,
+    int64_t value_stride, bool sort_by_value, bool abort_when_nan_found,
+    int* workspace, int parts, musaStream_t stream) {
+  const int topk = output.size(1);
+  if (topk > kValueSortFastMax) {
+    launch_two_stage_partitions<OutIndexT, 8192, 8192>(
+        input, output, values, value_stride, sort_by_value, abort_when_nan_found,
+        workspace, parts, stream);
+  } else if (topk > kFusedSortMax) {
+    launch_two_stage_partitions<OutIndexT, 4096, 8192>(
+        input, output, values, value_stride, sort_by_value, abort_when_nan_found,
+        workspace, parts, stream);
+  } else {
+    launch_two_stage_partitions<OutIndexT, kTwoStageSamples, 4096>(
+        input, output, values, value_stride, sort_by_value, abort_when_nan_found,
+        workspace, parts, stream);
+  }
+}
+
+void launch_topk_fp32_two_stage(
+    const at::Tensor& input, at::Tensor& output, at::Tensor& scratch,
+    const c10::optional<at::Tensor>& output_value, bool return_value,
+    bool sort_by_value, bool abort_when_nan_found, int parts) {
+  TORCH_CHECK(input.device().type() == c10::DeviceType::PrivateUse1 &&
+                  input.dim() == 2 && input.scalar_type() == at::kFloat &&
+                  input.stride(1) == 1 && input.size(1) >= kTwoStageSamples &&
+                  input.size(1) < (1 << 23),
+              "invalid two-stage input");
+  TORCH_CHECK(output.dim() == 2 && output.size(0) == input.size(0) &&
+                  output.size(1) > 0 && output.size(1) <= kTwoStageMaxTopK &&
+                  output.stride(1) == 1 &&
+                  (output.scalar_type() == at::kLong || output.scalar_type() == at::kInt) &&
+                  output.device() == input.device(),
+              "invalid two-stage indices");
+  TORCH_CHECK(scratch.scalar_type() == at::kInt && scratch.is_contiguous() &&
+                  scratch.device() == input.device() &&
+                  scratch.numel() >= two_stage_scratch_ints(input.size(0), parts),
+              "invalid two-stage scratch");
+  TORCH_CHECK(return_value == output_value.has_value() && (!sort_by_value || (return_value && output.size(1) <= kValueSortFastMax)),
+              "invalid two-stage value flags");
+  TORCH_CHECK(!return_value ||
+                  (output_value->scalar_type() == at::kFloat &&
+                   output_value->device() == input.device() &&
+                   output_value->sizes() == output.sizes() && output_value->stride(1) == 1),
+              "invalid two-stage values");
+
+  at::musa::MUSAGuard guard(input.device());
+  auto stream = at::musa::getCurrentMUSAStream(input.get_device()).stream();
+  float* values = return_value ? output_value->data_ptr<float>() : nullptr;
+  const int64_t value_stride = return_value ? output_value->stride(0) : 0;
+  int* workspace = scratch.data_ptr<int>();
+  if (output.scalar_type() == at::kLong) {
+    dispatch_two_stage_partitions<int64_t>(input, output, values, value_stride, sort_by_value,
+                                    abort_when_nan_found, workspace, parts, stream);
+  } else {
+    dispatch_two_stage_partitions<int32_t>(input, output, values, value_stride, sort_by_value,
+                                    abort_when_nan_found, workspace, parts, stream);
+  }
+  C10_MUSA_KERNEL_LAUNCH_CHECK();
 }
 
 struct Fp32MultiScratch {
@@ -3216,7 +3538,7 @@ void launch_sort_output_typed(
   const int sort_threads = topk > 1024 ? 1024 : (topk > 512 ? 512 : 256);
   if (sort_by_value) {
     if (topk > 1024)
-      radix_sort_packed_value_output_kernel<OutIndexT, 1024, 4>
+      radix_sort_packed_value_output_kernel<OutIndexT, 1024, 2>
           <<<rows, 1024, 0, stream>>>(
               output.data_ptr<OutIndexT>(), output_stride,
               output_value->data_ptr<float>(), output_value->stride(0),
@@ -3923,6 +4245,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def("topk_fp32", &launch_topk_fp32, "DeepSelect FP32 MUSA topk");
   module.def("topk_fp32_multi", &launch_topk_fp32_multi,
              "DeepSelect FP32 MUSA multi-CTA topk");
+  module.def("topk_fp32_two_stage", &launch_topk_fp32_two_stage,
+             "Experimental exact two-stage FP32 MUSA topk");
+  module.def("two_stage_scratch_ints", &two_stage_scratch_ints,
+             "Experimental two-stage scratch size in int32 words");
   module.def("output_idx_offset", &launch_output_idx_offset,
              "DeepSelect MUSA output index offset epilogue");
   module.def("sort_output", &launch_sort_output,

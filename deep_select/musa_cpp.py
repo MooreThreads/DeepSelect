@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import importlib
+import os
 from pathlib import Path
 
 import torch
@@ -17,6 +18,8 @@ _SOURCE = (
     / "topk.mu"
 )
 _scratch_cache: dict[tuple[torch.device, int, int, int, int], torch.Tensor] = {}
+_two_stage_scratch_cache: dict[tuple[torch.device, int, int, int], torch.Tensor] = {}
+_TWO_STAGE_PARTS = 16
 _persist_scratch_cache: dict[
     tuple[torch.device, int, int, int, int], torch.Tensor
 ] = {}
@@ -185,21 +188,49 @@ def launch_topk_fp32(
     sort_by_value: bool = False,
 ) -> bool:
     """Returns True when the selector already ordered the values itself."""
-    rows = input.shape[0]
+    rows, width = input.shape
+    topk = output.shape[1]
+    if (
+        end is None
+        and 0 < rows <= 16
+        and 262144 <= width <= 524288
+        and width % 4 == 0
+        and 128 <= topk <= 2048
+        and input.is_contiguous()
+        and os.getenv("DEEP_SELECT_MUSA_FP32_TWO_STAGE") == "1"
+        and torch.musa.get_device_capability(input.device) == (3, 1)
+    ):
+        parts = 8 if rows > 8 and 512 < topk <= 1024 else _TWO_STAGE_PARTS
+        module = _module()
+        launch = getattr(module, "topk_fp32_two_stage", None)
+        if launch is not None:
+            with torch.musa.device(input.device):
+                capturing = torch.musa.is_current_stream_capturing()
+                key = (input.device, torch.musa.current_stream().musa_stream, rows, parts)
+                scratch = None if capturing else _two_stage_scratch_cache.get(key)
+                if scratch is None:
+                    scratch = torch.empty(
+                        module.two_stage_scratch_ints(rows, parts),
+                        dtype=torch.int32,
+                        device=input.device,
+                    )
+                    if not capturing:
+                        _two_stage_scratch_cache[key] = scratch
+            fused_sort = sort_by_value and topk <= 1024
+            launch(
+                input, output, scratch, output_value, output_value is not None,
+                fused_sort, abort_when_nan_found, parts,
+            )
+            return fused_sort
     if (
         end is None
         and rows <= 8
-        and input.shape[1] >= 1048576
+        and width >= 1048576
         and input.is_contiguous()
     ):
-        if input.shape[1] >= 1048576:
-            parts = 48
-        elif input.shape[1] < 196608:
-            parts = 24
-        else:
-            parts = 32
+        parts = 48
         stream_id = torch.musa.current_stream(input.device).musa_stream
-        key = (input.device, stream_id, rows, input.shape[1], parts)
+        key = (input.device, stream_id, rows, width, parts)
         scratch = _fp32_scratch_cache.get(key)
         if scratch is None:
             elements = rows * parts * 256 + rows * parts + 7 * rows
