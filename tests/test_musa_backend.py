@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+import os
 import subprocess
 import sys
+import unittest.mock
 
 import torch
 import torch_musa  # noqa: F401
 
 import deep_select
-from deep_select import deep_select_musa
+from deep_select import deep_select_musa, musa_cpp
 import kernelkit as kk
 
 from lib import (
@@ -435,6 +438,263 @@ def _run_native_sort_epilogue_cases() -> None:
             short_values[row, selected_count:] == value_fill
         ).item()
 
+    wide_fp32 = torch.randn(4, 16384, dtype=torch.float32, device="musa")
+    for topk in (1025, 2048, 2049, 4096):
+        expected_vals, _ = torch.topk(wide_fp32, topk, dim=1, sorted=True)
+        for indices_type in (torch.int32, torch.int64):
+            vals, idxs = deep_select.topk(
+                wide_fp32,
+                topk,
+                sorted=True,
+                indices_type=indices_type,
+                return_value=True,
+                abort_when_nan_found=False,
+            )
+            torch.testing.assert_close(vals, expected_vals, rtol=0, atol=0)
+            torch.testing.assert_close(
+                torch.gather(wide_fp32, 1, idxs.to(torch.int64)),
+                expected_vals,
+                rtol=0,
+                atol=0,
+            )
+
+
+def _check_fp32_two_stage(
+    x: torch.Tensor,
+    topk: int,
+    *,
+    sorted_value: bool,
+    return_value: bool,
+    indices_type: torch.dtype,
+) -> None:
+    vals, idxs = deep_select.topk(
+        x,
+        topk,
+        sorted=sorted_value,
+        indices_type=indices_type,
+        return_value=return_value,
+        abort_when_nan_found=False,
+    )
+    expected_vals = torch.topk(x, topk, dim=1, sorted=True).values
+    ordered = torch.sort(idxs, dim=1).values
+    assert torch.all(ordered[:, 1:] != ordered[:, :-1]).item()
+    gathered = torch.gather(x, 1, idxs.to(torch.int64))
+    if sorted_value:
+        torch.testing.assert_close(vals, expected_vals, rtol=0, atol=0)
+        torch.testing.assert_close(gathered, expected_vals, rtol=0, atol=0)
+    else:
+        torch.testing.assert_close(
+            torch.sort(gathered, dim=1, descending=True).values,
+            expected_vals,
+            rtol=0,
+            atol=0,
+        )
+        if return_value:
+            torch.testing.assert_close(
+                torch.sort(vals, dim=1, descending=True).values,
+                expected_vals,
+                rtol=0,
+                atol=0,
+            )
+        else:
+            assert vals is None
+
+
+def _check_fp32_two_stage_modes(
+    x: torch.Tensor, ks: tuple[int, ...]
+) -> None:
+    for k in ks:
+        for sorted_value, return_value, indices_type in (
+            (True, True, torch.int32),
+            (False, False, torch.int64),
+        ):
+            _check_fp32_two_stage(
+                x,
+                k,
+                sorted_value=sorted_value,
+                return_value=return_value,
+                indices_type=indices_type,
+            )
+
+
+@contextmanager
+def _forbid_fp32_two_stage_kernel():
+    real_module = musa_cpp._module()
+
+    def _unexpected(*args, **kwargs):
+        raise AssertionError("topk_fp32_two_stage should not be called")
+
+    class _NoTwoStageModule:
+        def __getattr__(self, name: str):
+            if name == "topk_fp32_two_stage":
+                return _unexpected
+            return getattr(real_module, name)
+
+    with unittest.mock.patch.object(
+        musa_cpp, "_module", return_value=_NoTwoStageModule()
+    ):
+        yield
+
+
+def _run_fp32_two_stage_cases() -> None:
+    prior = os.environ.get("DEEP_SELECT_MUSA_FP32_TWO_STAGE")
+    os.environ.pop("DEEP_SELECT_MUSA_FP32_TWO_STAGE", None)
+    width = 262144
+    try:
+        default_off_x = torch.randn(
+            6, width, dtype=torch.float32, device="musa"
+        )
+        with _forbid_fp32_two_stage_kernel():
+            _check_fp32_two_stage_modes(default_off_x, (128, 512, 1024, 2048))
+        del default_off_x
+
+        os.environ["DEEP_SELECT_MUSA_FP32_TWO_STAGE"] = "1"
+        for rows in (1, 6, 16):
+            x = torch.randn(rows, width, dtype=torch.float32, device="musa")
+            for k in (128, 512, 1024, 2048):
+                for indices_type in (torch.int32, torch.int64):
+                    for sorted_value, return_value in (
+                        (False, False),
+                        (False, True),
+                        (True, True),
+                    ):
+                        _check_fp32_two_stage(
+                            x,
+                            k,
+                            sorted_value=sorted_value,
+                            return_value=return_value,
+                            indices_type=indices_type,
+                        )
+            del x
+
+        wide_x = torch.randn(6, 524288, dtype=torch.float32, device="musa")
+        _check_fp32_two_stage_modes(wide_x, (512, 2048))
+        del wide_x
+
+        all_equal = torch.full((6, width), 2.0, dtype=torch.float32, device="musa")
+        _check_fp32_two_stage_modes(all_equal, (512, 1024, 2048))
+        del all_equal
+
+        ties = torch.full((6, width), -1.0, dtype=torch.float32, device="musa")
+        ties[:, :200] = 5.0
+        ties[:, 200:5000] = 1.0
+        _check_fp32_two_stage_modes(ties, (512, 1024, 2048))
+        del ties
+
+        adversarial = torch.zeros(6, width, dtype=torch.float32, device="musa")
+        adversarial[:, 1:2001:2] = torch.linspace(
+            1.0, 2.0, 1000, dtype=torch.float32, device="musa"
+        )
+        _check_fp32_two_stage_modes(adversarial, (128, 512, 1024, 2048))
+        del adversarial
+
+        periodic = torch.zeros(6, width, dtype=torch.float32, device="musa")
+        step = width // 2048
+        periodic[:, 1::step] = torch.linspace(
+            1.0, 2.0, width // step, dtype=torch.float32, device="musa"
+        )
+        periodic[:, 2::step] = torch.linspace(
+            2.0, 3.0, width // step, dtype=torch.float32, device="musa"
+        )
+        periodic[:, 3::step] = torch.linspace(
+            3.0, 4.0, width // step, dtype=torch.float32, device="musa"
+        )
+        _check_fp32_two_stage_modes(periodic, (128, 512, 1024, 2048))
+        del periodic
+
+        nan_x = torch.randn(6, width, dtype=torch.float32, device="musa")
+        nan_x[:, 17] = float("nan")
+        for k in (512, 1024, 2048):
+            for sorted_value, return_value in ((False, False), (True, True)):
+                for indices_type in (torch.int32, torch.int64):
+                    _, nan_idxs = deep_select.topk(
+                        nan_x,
+                        k,
+                        sorted=sorted_value,
+                        indices_type=indices_type,
+                        return_value=return_value,
+                        abort_when_nan_found=False,
+                    )
+                    assert torch.all(nan_idxs[:, 0] == 0x3F3F3F3F).item()
+        del nan_x
+
+        for rows, k in ((6, 512), (16, 1024), (6, 2048)):
+            gx = torch.randn(rows, width, dtype=torch.float32, device="musa")
+            gout = torch.empty(rows, k, dtype=torch.int32, device="musa")
+            captured: list[tuple[torch.Tensor | None, torch.Tensor]] = []
+
+            def run_graph() -> None:
+                captured.clear()
+                captured.append(
+                    deep_select.topk(
+                        gx,
+                        k,
+                        sorted=True,
+                        indices_type=torch.int32,
+                        return_value=True,
+                        abort_when_nan_found=False,
+                    )
+                )
+                deep_select.topk(
+                    gx,
+                    k,
+                    output_idx=gout,
+                    indices_type=torch.int32,
+                    return_value=False,
+                    abort_when_nan_found=False,
+                )
+
+            stream = torch.musa.Stream()
+            with torch.musa.stream(stream):
+                run_graph()
+            stream.synchronize()
+            graph = torch.musa.MUSAGraph()
+            with torch.musa.graph(graph, stream=stream):
+                run_graph()
+            gx.normal_()
+            graph.replay()
+            torch.musa.synchronize()
+            gvals, gidxs = captured[0]
+            expected_vals = torch.topk(gx, k, dim=1, sorted=True).values
+            torch.testing.assert_close(gvals, expected_vals, rtol=0, atol=0)
+            torch.testing.assert_close(
+                torch.gather(gx, 1, gidxs.to(torch.int64)),
+                expected_vals,
+                rtol=0,
+                atol=0,
+            )
+            torch.testing.assert_close(
+                torch.sort(
+                    torch.gather(gx, 1, gout.to(torch.int64)),
+                    dim=1,
+                    descending=True,
+                ).values,
+                expected_vals,
+                rtol=0,
+                atol=0,
+            )
+
+        mp32_x = torch.randn(6, width, dtype=torch.float32, device="musa")
+        with (
+            unittest.mock.patch.object(
+                musa_cpp, "_device_capability", return_value=(3, 2)
+            ),
+            _forbid_fp32_two_stage_kernel(),
+        ):
+            _check_fp32_two_stage_modes(mp32_x, (128, 512, 1024, 2048))
+        del mp32_x
+
+        os.environ["DEEP_SELECT_MUSA_FP32_TWO_STAGE"] = "0"
+        opt_out_x = torch.randn(6, width, dtype=torch.float32, device="musa")
+        with _forbid_fp32_two_stage_kernel():
+            _check_fp32_two_stage_modes(opt_out_x, (128, 512, 1024, 2048))
+        del opt_out_x
+    finally:
+        if prior is None:
+            os.environ.pop("DEEP_SELECT_MUSA_FP32_TWO_STAGE", None)
+        else:
+            os.environ["DEEP_SELECT_MUSA_FP32_TWO_STAGE"] = prior
+
 
 def _run_native_sample_survivor_cases() -> None:
     batch = 4096
@@ -792,13 +1052,23 @@ torch.musa.synchronize()
 print("NO_DEVICE_TRAP", flush=True)
 """
     cases = (
-        ("bf16-single", "bfloat16", 4, 32768),
-        ("bf16-multi", "bfloat16", 1, 131072),
-        ("fp32-single", "float32", 4, 32768),
+        ("bf16-single", "bfloat16", 4, 32768, {}),
+        ("bf16-multi", "bfloat16", 1, 131072, {}),
+        ("fp32-single", "float32", 4, 32768, {}),
+        (
+            "fp32-two-stage",
+            "float32",
+            2,
+            262144,
+            {"DEEP_SELECT_MUSA_FP32_TWO_STAGE": "1"},
+        ),
     )
-    for name, dtype, batch, width in cases:
+    for name, dtype, batch, width, extra_env in cases:
+        env = os.environ.copy()
+        env.update(extra_env)
         completed = subprocess.run(
             [sys.executable, "-c", probe, dtype, str(batch), str(width)],
+            env=env,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -1157,11 +1427,13 @@ def _run_kernelkit_profile_case() -> None:
     assert any(
         "partial_fp32_histogram_kernel" in name
         or "topk_fp32_compact12_kernel" in name
+        or "topk_fp32_scan_partitions" in name
         for name in fp32_kernel_names
     ), fp32_kernel_names
     assert any(
         "finish_fp32_multi_kernel" in name
         or "topk_fp32_compact12_kernel" in name
+        or "topk_fp32_finish_partitions" in name
         for name in fp32_kernel_names
     ), fp32_kernel_names
 
@@ -1201,6 +1473,7 @@ def main() -> None:
     _run_native_topk_tiers()
     _run_native_value_cases()
     _run_native_sort_epilogue_cases()
+    _run_fp32_two_stage_cases()
     _run_native_sample_survivor_cases()
     _run_native_bf16_sample_survivor_cases()
     _run_native_offset_nan_cases()

@@ -196,6 +196,20 @@ NaN checking is always on. With the default `abort_when_nan_found=True`, CUDA
 invokes `trap()` and MUSA invokes a native device assertion from a guard kernel.
 CUDA and MUSA skip NaN checking for rows whose valid length is `<= topk`.
 
+### MUSA FP32 two-stage dispatch
+
+Set `DEEP_SELECT_MUSA_FP32_TWO_STAGE=1` to opt in to the two-stage selector
+(off by default). When enabled on MP31 `(3, 1)`, it handles contiguous FP32
+inputs without `end`, 1 to 16 rows, widths from 262144 to 524288 divisible by
+four, and `topk` from 128 to 2048 (`topk > 1024` uses the existing value sort
+when requested). The partition scan uses cyclic 128-element warp-tile
+partitioning with unified deferred `compact12` fallback when a partition
+overflows, while NaN rows produce the row sentinel and return early after the
+partition scan without taking the fallback path.
+
+See [`docs/environment_variables.md`](docs/environment_variables.md) for the
+environment variable reference.
+
 ## Citation
 
 ```text

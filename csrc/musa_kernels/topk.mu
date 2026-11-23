@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <limits>
+#include <type_traits>
 
 namespace {
 
@@ -1466,6 +1467,22 @@ __device__ __forceinline__ bool is_nan_key(uint32_t bits) {
          (bits & 0x007FFFFFu) != 0;
 }
 
+__device__ __forceinline__ bool is_nan_ordered_key(uint32_t key) {
+  return key > 0xff800000u || key < 0x007fffffu;
+}
+
+__device__ __forceinline__ int warp_lane0_atomic_add(int* ptr, int delta) {
+  int base = 0;
+  if ((threadIdx.x & 31) == 0) base = atomicAdd(ptr, delta);
+  return __shfl_sync(0xffffffffu, base, 0);
+}
+
+__device__ __forceinline__ int warp_reserve(int* count, uint32_t mask,
+                                            uint32_t lanes_before) {
+  return warp_lane0_atomic_add(count, __popc(mask)) +
+         __popc(mask & lanes_before);
+}
+
 __device__ __forceinline__ void histogram_fp32_top12(
     float value, int* histogram, int* nan_count) {
   const uint32_t bits = raw_bits(value);
@@ -1679,6 +1696,8 @@ constexpr int kValueSortFastMax = 1024;
 constexpr int kFusedSortMax = 512;
 constexpr int kValueSortBuckets = 256;
 constexpr int kValueSortMaxBucket = 32;
+constexpr int kValueSortScratchInts =
+    3 * kValueSortFastMax + 3 * kValueSortBuckets + 3;
 template <typename OutIndexT>
 __device__ __forceinline__ void sort_selected_row_by_value(
     OutIndexT* __restrict__ indices, float* __restrict__ row_values,
@@ -1710,22 +1729,30 @@ __device__ __forceinline__ bool fp32_sample_prefix_matches(
   }
 }
 
-template <int kByte, bool kCheckNan>
+template <int kByte, bool kCheckNan, typename ElemT = float>
 __device__ __forceinline__ void fp32_sample_radix_pass(
-    const float* values, int count, int* histogram, int* thresholds,
+    const ElemT* values, int count, int* histogram, int* thresholds,
     int* remain, int* nan_count, int first_wanted) {
   const int tid = static_cast<int>(threadIdx.x);
   const int threads = static_cast<int>(blockDim.x);
-  for (int bin = tid; bin < 256; bin += threads) histogram[bin] = 0;
-  __syncthreads();
+  if constexpr (kByte == 3) {
+    for (int bin = tid; bin < 256; bin += threads) histogram[bin] = 0;
+    __syncthreads();
+  }
   for (int position = tid; position < count; position += threads) {
-    const float value = values[position];
-    if constexpr (kCheckNan) {
-      if constexpr (kByte == 3) {
+    uint32_t key;
+    if constexpr (std::is_same_v<ElemT, uint32_t>) {
+      key = values[position];
+      if constexpr (kCheckNan && kByte == 3) {
+        if (is_nan_ordered_key(key)) atomicAdd(nan_count, 1);
+      }
+    } else {
+      const float value = values[position];
+      if constexpr (kCheckNan && kByte == 3) {
         if (is_nan_key(raw_bits(value))) atomicAdd(nan_count, 1);
       }
+      key = ordered_key(value);
     }
-    const uint32_t key = ordered_key(value);
     if (fp32_sample_prefix_matches<kByte>(key, thresholds))
       atomicAdd(&histogram[(key >> (8 * kByte)) & 0xFFu], 1);
   }
@@ -2285,6 +2312,392 @@ bool launch_topk_fp32_typed(
         input_ptr, output_ptr, width, input_stride, output_stride, values,
         value_stride, end_ptr, idx_fill, value_fill, topk, return_value);
   return false;
+}
+
+constexpr int kTwoStageThreads = 256;
+constexpr int kTwoStageCapacity = 768;
+constexpr int kTwoStageMaxParts = 16;
+constexpr int kTwoStageMaxTopK = 2048;
+constexpr int kTwoStageSmallTopK = 512;
+constexpr int kTwoStageMedTopK = 1024;
+
+struct TwoStagePart {
+  int strict_count;
+  int equal_count;
+  int has_nan;
+  int strict_cols[kTwoStageCapacity];
+  uint32_t strict_keys[kTwoStageCapacity];
+  int equal_cols[kTwoStageCapacity];
+};
+static_assert(sizeof(TwoStagePart) % sizeof(int) == 0);
+constexpr int kTwoStageWords =
+    static_cast<int>(sizeof(TwoStagePart) / sizeof(int));
+
+template <int kSamplesVal, int kFinishCapacityVal, bool kPrecheckVal,
+          bool kAllowFusedSortVal, int kSigmaTenthsVal>
+struct TwoStagePolicy {
+  static constexpr int kSamples = kSamplesVal;
+  static constexpr int kFinishCapacity = kFinishCapacityVal;
+  static constexpr bool kPrecheck = kPrecheckVal;
+  static constexpr bool kAllowFusedSort = kAllowFusedSortVal;
+  static constexpr float kSigma = static_cast<float>(kSigmaTenthsVal) * 0.1f;
+};
+
+using TwoStageSmallPolicy = TwoStagePolicy<2048, 4096, false, true, 25>;
+using TwoStageMedPolicy = TwoStagePolicy<4096, 8192, true, true, 35>;
+using TwoStageLargePolicy = TwoStagePolicy<8192, 8192, true, false, 35>;
+
+template <typename Policy>
+__global__ void topk_fp32_scan_partitions(
+    const float* input, int width, int64_t stride, int topk, int* workspace) {
+  const int tid = threadIdx.x;
+  const float* row = input + static_cast<int64_t>(blockIdx.y) * stride;
+  TwoStagePart* part =
+      reinterpret_cast<TwoStagePart*>(workspace) +
+      static_cast<int64_t>(blockIdx.y) * gridDim.x + blockIdx.x;
+  __shared__ uint32_t sample[Policy::kSamples];
+  __shared__ int hist[kRadix], thresholds[4], remain;
+  __shared__ int strict_count, equal_count, has_nan;
+  if (tid == 0) strict_count = equal_count = has_nan = 0;
+  for (int i = tid; i < Policy::kSamples; i += blockDim.x) {
+    const int lo = static_cast<int64_t>(i) * width / Policy::kSamples;
+    const int hi = static_cast<int64_t>(i + 1) * width / Policy::kSamples;
+    const uint32_t h = static_cast<uint32_t>(i) * 0x9e3779b9u;
+    const int offset =
+        static_cast<uint64_t>(h ^ (h >> 16)) * (hi - lo) >> 32;
+    sample[i] = ordered_key(row[lo + offset]);
+  }
+  __syncthreads();
+
+  const float mean = static_cast<float>(topk * Policy::kSamples) / width;
+  const int rank = min(
+      Policy::kSamples,
+      max(1, static_cast<int>(mean + Policy::kSigma * sqrtf(mean + 1)) + 2));
+  fp32_sample_radix_pass<3, false, uint32_t>(
+      sample, Policy::kSamples, hist, thresholds, &remain, nullptr, rank);
+  fp32_sample_radix_pass<2, false, uint32_t>(
+      sample, Policy::kSamples, hist, thresholds, &remain, nullptr, rank);
+  fp32_sample_radix_pass<1, false, uint32_t>(
+      sample, Policy::kSamples, hist, thresholds, &remain, nullptr, rank);
+  fp32_sample_radix_pass<0, false, uint32_t>(
+      sample, Policy::kSamples, hist, thresholds, &remain, nullptr, rank);
+  const uint32_t pivot = (static_cast<uint32_t>(thresholds[3]) << 24) |
+      (thresholds[2] << 16) | (thresholds[1] << 8) | thresholds[0];
+
+  const uint32_t lanes_before = (1u << (tid & 31)) - 1;
+  const auto collect = [&](int col, uint32_t key, bool valid) {
+    const bool nan = valid && is_nan_ordered_key(key);
+    const bool strict = valid && !nan && key > pivot;
+    const bool equal = valid && key == pivot;
+    if (nan) atomicOr(&has_nan, 1);
+
+    const uint32_t hits = __ballot_sync(
+        0xffffffffu, Policy::kPrecheck ? (strict || equal) : strict);
+    if constexpr (Policy::kPrecheck) {
+      if (!hits) return;
+    }
+    const uint32_t equal_mask = __ballot_sync(0xffffffffu, equal);
+    const uint32_t strict_mask =
+        Policy::kPrecheck ? (hits & ~equal_mask) : hits;
+    if (strict_mask) {
+      const int pos = warp_reserve(&strict_count, strict_mask, lanes_before);
+      if (strict && pos < kTwoStageCapacity) {
+        part->strict_cols[pos] = col;
+        part->strict_keys[pos] = key;
+      }
+    }
+    if (equal_mask) {
+      const int pos = warp_reserve(&equal_count, equal_mask, lanes_before);
+      if (equal && pos < kTwoStageCapacity) part->equal_cols[pos] = col;
+    }
+  };
+  const int vecs = width / 4;
+  const bool aligned = (reinterpret_cast<uintptr_t>(row) & 15) == 0;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const int warps = blockDim.x >> 5;
+  for (int tile = blockIdx.x * warps + warp; tile * 32 < vecs;
+       tile += gridDim.x * warps) {
+    const int i = tile * 32 + lane;
+    const bool in_bounds = i < vecs;
+    Floatx4 v{};
+    if (in_bounds) {
+      if (aligned) v = load_floatx4(row + 4 * i);
+      else for (int j = 0; j < 4; ++j) v.values[j] = row[4 * i + j];
+    }
+    uint32_t keys[4];
+    bool any = false;
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      keys[j] = ordered_key(v.values[j]);
+      if constexpr (Policy::kPrecheck) {
+        any |= keys[j] >= pivot || is_nan_ordered_key(keys[j]);
+      }
+    }
+    bool run_warp = true;
+    if constexpr (Policy::kPrecheck) {
+      run_warp = __ballot_sync(0xffffffffu, in_bounds && any) != 0;
+    }
+    if (run_warp) {
+      #pragma unroll
+      for (int j = 0; j < 4; ++j) collect(4 * i + j, keys[j], in_bounds);
+    }
+  }
+  __syncthreads();
+  if (tid == 0) {
+    part->strict_count = strict_count;
+    part->equal_count = equal_count;
+    part->has_nan = has_nan;
+  }
+}
+
+template <typename OutIndexT, typename Policy>
+__global__ void topk_fp32_finish_partitions(
+    const float* input, int width, int64_t stride, OutIndexT* output,
+    int64_t output_stride, float* values, int64_t value_stride, int topk,
+    bool sort_by_value, const int* workspace, int parts) {
+  const int tid = threadIdx.x;
+  const float* row = input + static_cast<int64_t>(blockIdx.x) * stride;
+  OutIndexT* indices = output + static_cast<int64_t>(blockIdx.x) * output_stride;
+  float* row_values =
+      values ? values + static_cast<int64_t>(blockIdx.x) * value_stride : nullptr;
+  const TwoStagePart* row_parts =
+      reinterpret_cast<const TwoStagePart*>(workspace) +
+      static_cast<int64_t>(blockIdx.x) * parts;
+  __shared__ int offsets[kTwoStageMaxParts + 1], eq_offsets[kTwoStageMaxParts + 1];
+  __shared__ int exact_full, fill_ties, has_nan;
+  __shared__ int thresholds[4], remain, output_count;
+  union FinishStorage {
+    struct {
+      int hist[kRadix];
+      uint32_t keys[Policy::kFinishCapacity];
+      int cols[Policy::kFinishCapacity];
+    } sel;
+    int sort_scratch[Policy::kAllowFusedSort ? kValueSortScratchInts : 1];
+  };
+  __shared__ FinishStorage storage;
+
+  storage.sel.hist[tid] = 0;
+  if (tid == 0) {
+    offsets[0] = eq_offsets[0] = 0;
+    exact_full = has_nan = output_count = 0;
+    for (int p = 0; p < parts; ++p) {
+      const TwoStagePart& part = row_parts[p];
+      exact_full |= part.strict_count > kTwoStageCapacity;
+      has_nan |= part.has_nan;
+      offsets[p + 1] = offsets[p] + min(part.strict_count, kTwoStageCapacity);
+      eq_offsets[p + 1] =
+          eq_offsets[p] + min(part.equal_count, kTwoStageCapacity);
+    }
+    const int strict = offsets[parts];
+    exact_full |= strict > Policy::kFinishCapacity ||
+                  strict + eq_offsets[parts] < topk;
+    fill_ties = !exact_full && strict <= topk;
+  }
+  __syncthreads();
+
+  if (has_nan) {
+    if (tid == 0) indices[0] = static_cast<OutIndexT>(kNanSentinel);
+    return;
+  }
+  if (exact_full) {
+    if (tid == 0) indices[0] = static_cast<OutIndexT>(kSampleFallbackSentinel);
+    return;
+  }
+
+  const int count = offsets[parts];
+
+  if (fill_ties) {
+    for (int p = 0; p < parts; ++p) {
+      const TwoStagePart& part = row_parts[p];
+      const int n_strict = offsets[p + 1] - offsets[p];
+      for (int s = tid; s < n_strict; s += blockDim.x) {
+        const int col = part.strict_cols[s];
+        store_topk_result(
+            indices, row_values, values != nullptr, offsets[p] + s, col,
+            values ? value_from_ordered_key(part.strict_keys[s]) : 0.0f);
+      }
+    }
+    const int strict_total = offsets[parts];
+    for (int p = 0; p < parts; ++p) {
+      const int rem = topk - (strict_total + eq_offsets[p]);
+      if (rem <= 0) break;
+      const TwoStagePart& part = row_parts[p];
+      const int take = min(rem, eq_offsets[p + 1] - eq_offsets[p]);
+      for (int e = tid; e < take; e += blockDim.x) {
+        const int col = part.equal_cols[e];
+        store_topk_result(
+            indices, row_values, values != nullptr,
+            strict_total + eq_offsets[p] + e, col, values ? row[col] : 0.0f);
+      }
+    }
+  } else {
+    for (int p = 0; p < parts; ++p) {
+      const TwoStagePart& part = row_parts[p];
+      for (int i = offsets[p] + tid; i < offsets[p + 1]; i += blockDim.x) {
+        const int slot = i - offsets[p];
+        storage.sel.cols[i] = part.strict_cols[slot];
+        storage.sel.keys[i] = part.strict_keys[slot];
+      }
+    }
+    __syncthreads();
+    uint32_t prefix = 0;
+    uint32_t mask = 0;
+    for (int byte = 3; byte >= 0; --byte) {
+      for (int i = tid; i < count; i += blockDim.x) {
+        const uint32_t key = storage.sel.keys[i];
+        if ((key & mask) == prefix)
+          atomicAdd(storage.sel.hist + ((key >> (8 * byte)) & 255), 1);
+      }
+      __syncthreads();
+      warp_select(storage.sel.hist, byte == 3 ? topk : remain,
+                  thresholds + byte, &remain);
+      __syncthreads();
+      const uint32_t byte_mask = 255u << (8 * byte);
+      mask |= byte_mask;
+      prefix |= static_cast<uint32_t>(thresholds[byte]) << (8 * byte);
+    }
+    const int rounds = (count + blockDim.x - 1) / blockDim.x;
+    const uint32_t lanes_before = (1u << (tid & 31)) - 1;
+    for (int round = 0; round < rounds; ++round) {
+      const int i = round * blockDim.x + tid;
+      const bool valid = i < count;
+      const int col = valid ? storage.sel.cols[i] : 0;
+      const uint32_t key = valid ? storage.sel.keys[i] : 0;
+      const uint32_t strict_mask =
+          __ballot_sync(0xffffffffu, valid && key > prefix);
+      if (strict_mask) {
+        const int pos = warp_reserve(&output_count, strict_mask, lanes_before);
+        if (valid && key > prefix) {
+          store_topk_result(
+              indices, row_values, values != nullptr, pos, col,
+              values ? value_from_ordered_key(key) : 0.0f);
+        }
+      }
+      const uint32_t equal_mask =
+          __ballot_sync(0xffffffffu, valid && key == prefix);
+      if (equal_mask) {
+        const int left = warp_lane0_atomic_add(&remain, -__popc(equal_mask));
+        if (valid && key == prefix) {
+          const int pos = topk - left + __popc(equal_mask & lanes_before);
+          if (pos < topk) {
+            store_topk_result(
+                indices, row_values, values != nullptr, pos, col,
+                values ? value_from_ordered_key(key) : 0.0f);
+          }
+        }
+      }
+    }
+  }
+  if constexpr (Policy::kAllowFusedSort) {
+    if (sort_by_value) {
+      __syncthreads();
+      sort_selected_row_by_value_impl<OutIndexT, true>(
+          indices, row_values, topk, topk, storage.sort_scratch);
+    }
+  }
+}
+
+int64_t two_stage_scratch_ints(int64_t rows, int64_t parts) {
+  TORCH_CHECK(rows > 0 && rows <= 65535 && parts >= 1 && parts <= kTwoStageMaxParts,
+              "invalid two-stage grid");
+  return rows * parts * kTwoStageWords;
+}
+
+template <typename OutIndexT, typename Policy>
+void launch_two_stage_partitions(
+    const at::Tensor& input, at::Tensor& output, float* values,
+    int64_t value_stride, bool sort_by_value, bool abort_when_nan_found,
+    int* workspace, int parts, musaStream_t stream) {
+  const dim3 grid(parts, input.size(0));
+  topk_fp32_scan_partitions<Policy><<<grid, kTwoStageThreads, 0, stream>>>(
+      input.data_ptr<float>(), input.size(1), input.stride(0), output.size(1),
+      workspace);
+  auto* indices = output.data_ptr<OutIndexT>();
+  const int rows = input.size(0);
+  const int topk = output.size(1);
+  topk_fp32_finish_partitions<OutIndexT, Policy>
+      <<<rows, kTwoStageThreads, 0, stream>>>(
+          input.data_ptr<float>(), input.size(1), input.stride(0), indices,
+          output.stride(0), values, value_stride, topk, sort_by_value,
+          workspace, parts);
+  topk_fp32_compact12_kernel<1024, 4096, OutIndexT, false, true>
+      <<<rows, 1024, 0, stream>>>(
+          input.data_ptr<float>(), indices, input.size(1), input.stride(0),
+          output.stride(0), values, value_stride, nullptr, OutIndexT{0}, 0.0f,
+          topk, values != nullptr, sort_by_value);
+  if (abort_when_nan_found) launch_nan_guard(indices, rows, output.stride(0), stream);
+}
+
+template <typename OutIndexT>
+void dispatch_two_stage_partitions(
+    const at::Tensor& input, at::Tensor& output, float* values,
+    int64_t value_stride, bool sort_by_value, bool abort_when_nan_found,
+    int* workspace, int parts, musaStream_t stream) {
+  const int topk = output.size(1);
+  if (topk > kTwoStageMedTopK) {
+    launch_two_stage_partitions<OutIndexT, TwoStageLargePolicy>(
+        input, output, values, value_stride, sort_by_value, abort_when_nan_found,
+        workspace, parts, stream);
+  } else if (topk > kTwoStageSmallTopK) {
+    launch_two_stage_partitions<OutIndexT, TwoStageMedPolicy>(
+        input, output, values, value_stride, sort_by_value, abort_when_nan_found,
+        workspace, parts, stream);
+  } else {
+    launch_two_stage_partitions<OutIndexT, TwoStageSmallPolicy>(
+        input, output, values, value_stride, sort_by_value, abort_when_nan_found,
+        workspace, parts, stream);
+  }
+}
+
+void launch_topk_fp32_two_stage(
+    const at::Tensor& input, at::Tensor& output, at::Tensor& scratch,
+    const c10::optional<at::Tensor>& output_value, bool sort_by_value,
+    bool abort_when_nan_found, int parts) {
+  const bool return_value = output_value.has_value();
+  TORCH_CHECK(input.device().type() == c10::DeviceType::PrivateUse1 &&
+                  input.dim() == 2 && input.scalar_type() == at::kFloat &&
+                  input.stride(1) == 1 && input.size(1) % 4 == 0 &&
+                  input.size(1) < (1 << 23),
+              "invalid two-stage input");
+  TORCH_CHECK(output.dim() == 2 && output.size(0) == input.size(0) &&
+                  output.size(1) > 0 && output.size(1) <= kTwoStageMaxTopK &&
+                  output.stride(1) == 1 &&
+                  (output.scalar_type() == at::kLong || output.scalar_type() == at::kInt) &&
+                  output.device() == input.device(),
+              "invalid two-stage indices");
+  const int64_t topk = output.size(1);
+  const int min_samples = topk > kTwoStageMedTopK
+                              ? TwoStageLargePolicy::kSamples
+                              : (topk > kTwoStageSmallTopK
+                                     ? TwoStageMedPolicy::kSamples
+                                     : TwoStageSmallPolicy::kSamples);
+  TORCH_CHECK(input.size(1) >= min_samples, "invalid two-stage input");
+  TORCH_CHECK(scratch.scalar_type() == at::kInt && scratch.is_contiguous() &&
+                  scratch.device() == input.device() &&
+                  scratch.numel() >= two_stage_scratch_ints(input.size(0), parts),
+              "invalid two-stage scratch");
+  TORCH_CHECK(!sort_by_value || (return_value && output.size(1) <= kTwoStageMedTopK),
+              "invalid two-stage value flags");
+  TORCH_CHECK(!return_value ||
+                  (output_value->scalar_type() == at::kFloat &&
+                   output_value->device() == input.device() &&
+                   output_value->sizes() == output.sizes() && output_value->stride(1) == 1),
+              "invalid two-stage values");
+
+  at::musa::MUSAGuard guard(input.device());
+  auto stream = at::musa::getCurrentMUSAStream(input.get_device()).stream();
+  float* values = return_value ? output_value->data_ptr<float>() : nullptr;
+  const int64_t value_stride = return_value ? output_value->stride(0) : 0;
+  int* workspace = scratch.data_ptr<int>();
+  if (output.scalar_type() == at::kLong) {
+    dispatch_two_stage_partitions<int64_t>(input, output, values, value_stride, sort_by_value,
+                                    abort_when_nan_found, workspace, parts, stream);
+  } else {
+    dispatch_two_stage_partitions<int32_t>(input, output, values, value_stride, sort_by_value,
+                                    abort_when_nan_found, workspace, parts, stream);
+  }
+  C10_MUSA_KERNEL_LAUNCH_CHECK();
 }
 
 struct Fp32MultiScratch {
@@ -3199,63 +3612,6 @@ __global__ void sort_value_output_bucket_kernel(
   }
 }
 
-template <typename OutIndexT>
-__global__ void sort_value_output_kernel(
-    OutIndexT* __restrict__ output, int64_t output_stride,
-    float* __restrict__ values, int64_t value_stride,
-    const int* __restrict__ end_ptr, int full_length, int topk) {
-  __shared__ uint64_t shared_items[kMaxTopK];
-
-  const int row_index = static_cast<int>(blockIdx.x);
-  int valid_count = end_ptr ? end_ptr[row_index] : full_length;
-  if (valid_count > topk) valid_count = topk;
-  if (valid_count <= 1) return;
-  OutIndexT* row = output + static_cast<int64_t>(row_index) * output_stride;
-  if (row[0] == static_cast<OutIndexT>(kNanSentinel)) return;
-  float* row_values = values + static_cast<int64_t>(row_index) * value_stride;
-
-  int sort_width = 1;
-  while (sort_width < valid_count) sort_width <<= 1;
-  for (int position = static_cast<int>(threadIdx.x); position < sort_width;
-       position += static_cast<int>(blockDim.x)) {
-    if (position < valid_count) {
-      const uint64_t value_key = ordered_key(row_values[position]);
-      const uint64_t index = static_cast<uint64_t>(row[position]);
-      shared_items[position] = (value_key << 24) | (index << 1) | 1u;
-    } else {
-      shared_items[position] = 0;
-    }
-  }
-  __syncthreads();
-
-  for (int sequence = 2; sequence <= sort_width; sequence <<= 1) {
-    for (int distance = sequence >> 1; distance > 0; distance >>= 1) {
-      for (int position = static_cast<int>(threadIdx.x);
-           position < sort_width;
-           position += static_cast<int>(blockDim.x)) {
-        const int partner = position ^ distance;
-        if (partner <= position) continue;
-        const bool descending = (position & sequence) == 0;
-        const uint64_t left = shared_items[position];
-        const uint64_t right = shared_items[partner];
-        if ((descending && left < right) || (!descending && left > right)) {
-          shared_items[position] = right;
-          shared_items[partner] = left;
-        }
-      }
-      __syncthreads();
-    }
-  }
-
-  for (int position = static_cast<int>(threadIdx.x); position < valid_count;
-       position += static_cast<int>(blockDim.x)) {
-    const uint64_t item = shared_items[position];
-    row[position] = static_cast<OutIndexT>((item >> 1) & 0x7FFFFFu);
-    row_values[position] =
-        value_from_ordered_key(static_cast<uint32_t>(item >> 24));
-  }
-}
-
 template <typename OutIndexT, int kThreads, int kItemsPerThread>
 __global__ void radix_sort_packed_value_output_kernel(
     OutIndexT* __restrict__ output, int64_t output_stride,
@@ -3308,21 +3664,21 @@ void launch_sort_output_typed(
   const int64_t output_stride = output.stride(0);
   const int sort_threads = topk > 1024 ? 1024 : (topk > 512 ? 512 : 256);
   if (sort_by_value) {
-    if (topk > 1024)
+    if (topk > 2048)
       radix_sort_packed_value_output_kernel<OutIndexT, 1024, 4>
           <<<rows, 1024, 0, stream>>>(
               output.data_ptr<OutIndexT>(), output_stride,
               output_value->data_ptr<float>(), output_value->stride(0),
               end_ptr, full_length, topk);
-    else if (topk <= kValueSortFastMax)
-      sort_value_output_bucket_kernel<OutIndexT>
-          <<<rows, 256, 0, stream>>>(
+    else if (topk > 1024)
+      radix_sort_packed_value_output_kernel<OutIndexT, 1024, 2>
+          <<<rows, 1024, 0, stream>>>(
               output.data_ptr<OutIndexT>(), output_stride,
               output_value->data_ptr<float>(), output_value->stride(0),
               end_ptr, full_length, topk);
     else
-      sort_value_output_kernel<OutIndexT>
-          <<<rows, sort_threads, 0, stream>>>(
+      sort_value_output_bucket_kernel<OutIndexT>
+          <<<rows, 256, 0, stream>>>(
               output.data_ptr<OutIndexT>(), output_stride,
               output_value->data_ptr<float>(), output_value->stride(0),
               end_ptr, full_length, topk);
@@ -4018,6 +4374,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def("topk_fp32", &launch_topk_fp32, "DeepSelect FP32 MUSA topk");
   module.def("topk_fp32_multi", &launch_topk_fp32_multi,
              "DeepSelect FP32 MUSA multi-CTA topk");
+  module.def("topk_fp32_two_stage", &launch_topk_fp32_two_stage,
+             "Experimental exact two-stage FP32 MUSA topk");
+  module.def("two_stage_scratch_ints", &two_stage_scratch_ints,
+             "Experimental two-stage scratch size in int32 words");
   module.def("output_idx_offset", &launch_output_idx_offset,
              "DeepSelect MUSA output index offset epilogue");
   module.def("sort_output", &launch_sort_output,
