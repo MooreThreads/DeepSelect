@@ -192,8 +192,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 -m pip install --no-deps --force-reinstall \
-            --index-url https://moorethreads.github.io/deepselect-whl/musa52-torch211/ \
-            "deepselect-musa==${{ needs.build-and-test.outputs.version }}+musa5.2.0torch2.11.0.post1"
+            "deepselect-musa==${{ needs.build-and-test.outputs.version }}"
       - name: Evidence
         run: |
           set -euo pipefail
