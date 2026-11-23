@@ -186,6 +186,9 @@ partitioning with unified deferred `compact12` fallback when a partition
 overflows, while NaN rows produce the row sentinel and return early after the
 partition scan without taking the fallback path.
 
+See [`docs/environment_variables.md`](docs/environment_variables.md) for the
+environment variable reference.
+
 ## Citation
 
 ```text
