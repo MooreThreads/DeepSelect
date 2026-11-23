@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import functools
 import hashlib
 import importlib
 import os
 from pathlib import Path
+from typing import Any
 
 import torch
 
@@ -17,15 +19,39 @@ _SOURCE = (
     / "musa_kernels"
     / "topk.mu"
 )
-_scratch_cache: dict[tuple[torch.device, int, int, int, int], torch.Tensor] = {}
-_two_stage_scratch_cache: dict[tuple[torch.device, int, int, int], torch.Tensor] = {}
+_scratch_cache: dict[tuple[Any, ...], torch.Tensor] = {}
+_two_stage_scratch_cache: dict[tuple[Any, ...], torch.Tensor] = {}
+_persist_scratch_cache: dict[tuple[Any, ...], torch.Tensor] = {}
+_fp32_scratch_cache: dict[tuple[Any, ...], torch.Tensor] = {}
 _TWO_STAGE_PARTS = 16
-_persist_scratch_cache: dict[
-    tuple[torch.device, int, int, int, int], torch.Tensor
-] = {}
 _PERSIST_MAX_ROWS = 8
 _PERSIST_MIN_WIDTH = 16384  # the sampler's real widths are 128K/129280
 _PERSIST_MAX_TOPK = 2048
+
+
+@functools.lru_cache(maxsize=None)
+def _device_capability(device_index: int) -> tuple[int, int]:
+    return torch.musa.get_device_capability(device_index)
+
+
+def _get_scratch(
+    cache: dict[tuple[Any, ...], torch.Tensor],
+    device: torch.device,
+    key_parts: tuple[int, ...],
+    size_fn: Callable[[], int],
+    *,
+    zero: bool = False,
+) -> torch.Tensor:
+    with torch.musa.device(device):
+        capturing = torch.musa.is_current_stream_capturing()
+        key = (device, torch.musa.current_stream().musa_stream, *key_parts)
+        scratch = None if capturing else cache.get(key)
+        if scratch is None:
+            alloc = torch.zeros if zero else torch.empty
+            scratch = alloc(size_fn(), dtype=torch.int32, device=device)
+            if not capturing:
+                cache[key] = scratch
+        return scratch
 
 
 def _persist_parts(rows: int, width: int) -> int | None:
@@ -47,9 +73,6 @@ def _persist_parts(rows: int, width: int) -> int | None:
         if (width + parts - 1) // parts % 8 == 0:
             return parts
     return None
-_fp32_scratch_cache: dict[
-    tuple[torch.device, int, int, int, int], torch.Tensor
-] = {}
 
 
 @functools.lru_cache(maxsize=1)
@@ -122,16 +145,13 @@ def launch_topk_bf16(
     )
     if parts is not None:
         threads = 256 if rows == 1 else 1024
-        stream_id = torch.musa.current_stream(input.device).musa_stream
-        key = (input.device, stream_id, rows, width, parts)
-        scratch = _persist_scratch_cache.get(key)
-        if scratch is None:
-            scratch = torch.zeros(
-                _module().persist_scratch_ints(rows),
-                dtype=torch.int32,
-                device=input.device,
-            )
-            _persist_scratch_cache[key] = scratch
+        scratch = _get_scratch(
+            _persist_scratch_cache,
+            input.device,
+            (rows, width, parts),
+            lambda: _module().persist_scratch_ints(rows),
+            zero=True,
+        )
         _module().topk_bf16_persist(
             input,
             output,
@@ -144,18 +164,17 @@ def launch_topk_bf16(
         return
     if end is None and rows <= 8 and input.shape[1] > 131072:
         parts = 48 if input.shape[1] >= 1048576 else 32
-        stream_id = torch.musa.current_stream(input.device).musa_stream
-        key = (input.device, stream_id, rows, input.shape[1], parts)
-        scratch = _scratch_cache.get(key)
-        if scratch is None:
-            elements = (
+        scratch = _get_scratch(
+            _scratch_cache,
+            input.device,
+            (rows, input.shape[1], parts),
+            lambda: (
                 2 * rows * parts * 256
                 + 2 * rows * parts
                 + 6 * rows
                 + rows * input.shape[1]
-            )
-            scratch = torch.empty(elements, dtype=torch.int32, device=input.device)
-            _scratch_cache[key] = scratch
+            ),
+        )
         _module().topk_bf16_multi(
             input,
             output,
@@ -191,34 +210,33 @@ def launch_topk_fp32(
     rows, width = input.shape
     topk = output.shape[1]
     if (
-        end is None
+        os.getenv("DEEP_SELECT_MUSA_FP32_TWO_STAGE") == "1"
+        and end is None
         and 0 < rows <= 16
         and 262144 <= width <= 524288
         and width % 4 == 0
         and 128 <= topk <= 2048
         and input.is_contiguous()
-        and os.getenv("DEEP_SELECT_MUSA_FP32_TWO_STAGE") == "1"
-        and torch.musa.get_device_capability(input.device) == (3, 1)
+        and _device_capability(
+            input.device.index
+            if input.device.index is not None
+            else torch.musa.current_device()
+        )
+        == (3, 1)
     ):
         parts = 8 if rows > 8 and 512 < topk <= 1024 else _TWO_STAGE_PARTS
         module = _module()
         launch = getattr(module, "topk_fp32_two_stage", None)
         if launch is not None:
-            with torch.musa.device(input.device):
-                capturing = torch.musa.is_current_stream_capturing()
-                key = (input.device, torch.musa.current_stream().musa_stream, rows, parts)
-                scratch = None if capturing else _two_stage_scratch_cache.get(key)
-                if scratch is None:
-                    scratch = torch.empty(
-                        module.two_stage_scratch_ints(rows, parts),
-                        dtype=torch.int32,
-                        device=input.device,
-                    )
-                    if not capturing:
-                        _two_stage_scratch_cache[key] = scratch
+            scratch = _get_scratch(
+                _two_stage_scratch_cache,
+                input.device,
+                (rows, parts),
+                lambda: module.two_stage_scratch_ints(rows, parts),
+            )
             fused_sort = sort_by_value and topk <= 1024
             launch(
-                input, output, scratch, output_value, output_value is not None,
+                input, output, scratch, output_value,
                 fused_sort, abort_when_nan_found, parts,
             )
             return fused_sort
@@ -229,15 +247,12 @@ def launch_topk_fp32(
         and input.is_contiguous()
     ):
         parts = 48
-        stream_id = torch.musa.current_stream(input.device).musa_stream
-        key = (input.device, stream_id, rows, width, parts)
-        scratch = _fp32_scratch_cache.get(key)
-        if scratch is None:
-            elements = rows * parts * 256 + rows * parts + 7 * rows
-            scratch = torch.empty(
-                elements, dtype=torch.int32, device=input.device
-            )
-            _fp32_scratch_cache[key] = scratch
+        scratch = _get_scratch(
+            _fp32_scratch_cache,
+            input.device,
+            (rows, width, parts),
+            lambda: rows * parts * 256 + rows * parts + 7 * rows,
+        )
         _module().topk_fp32_multi(
             input,
             output,

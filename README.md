@@ -182,8 +182,8 @@ MP31. The selector accepts contiguous FP32 input without `end`, 1 to 16
 rows, widths from 262144 to 524288 divisible by four, and `topk` from
 128 to 2048. Results with `topk > 1024` use the existing
 value sort when requested. Other calls use the existing dispatch. The flag is off by
-default. NaN rows still produce the row sentinel and may take the slower
-full-row path.
+default. NaN rows produce the row sentinel and return early after the
+partition scan without taking the full-row fallback.
 
 ## Citation
 
