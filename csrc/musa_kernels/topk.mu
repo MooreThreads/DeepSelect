@@ -1384,6 +1384,12 @@ __device__ __forceinline__ int warp_lane0_atomic_add(int* ptr, int delta) {
   return __shfl_sync(0xffffffffu, base, 0);
 }
 
+__device__ __forceinline__ int warp_reserve(int* count, uint32_t mask,
+                                            uint32_t lanes_before) {
+  return warp_lane0_atomic_add(count, __popc(mask)) +
+         __popc(mask & lanes_before);
+}
+
 __device__ __forceinline__ void histogram_fp32_top12(
     float value, int* histogram, int* nan_count) {
   const uint32_t bits = raw_bits(value);
@@ -2234,22 +2240,19 @@ static_assert(sizeof(TwoStagePart) % sizeof(int) == 0);
 constexpr int kTwoStageWords =
     static_cast<int>(sizeof(TwoStagePart) / sizeof(int));
 
-template <int kSamplesVal, int kFinishCapacityVal, bool kJitterVal,
-          bool kPrecheckVal, bool kAllowFusedSortVal, int kSigmaTenthsVal>
+template <int kSamplesVal, int kFinishCapacityVal, bool kPrecheckVal,
+          bool kAllowFusedSortVal, int kSigmaTenthsVal>
 struct TwoStagePolicy {
   static constexpr int kSamples = kSamplesVal;
   static constexpr int kFinishCapacity = kFinishCapacityVal;
-  static constexpr bool kJitter = kJitterVal;
   static constexpr bool kPrecheck = kPrecheckVal;
   static constexpr bool kAllowFusedSort = kAllowFusedSortVal;
   static constexpr float kSigma = static_cast<float>(kSigmaTenthsVal) * 0.1f;
 };
 
-using TwoStageSmallPolicy =
-    TwoStagePolicy<2048, 4096, true, false, true, 25>;
-using TwoStageMedPolicy = TwoStagePolicy<4096, 8192, true, true, true, 35>;
-using TwoStageLargePolicy =
-    TwoStagePolicy<8192, 8192, true, true, false, 35>;
+using TwoStageSmallPolicy = TwoStagePolicy<2048, 4096, false, true, 25>;
+using TwoStageMedPolicy = TwoStagePolicy<4096, 8192, true, true, 35>;
+using TwoStageLargePolicy = TwoStagePolicy<8192, 8192, true, false, 35>;
 
 template <typename Policy>
 __global__ void topk_fp32_scan_partitions(
@@ -2260,19 +2263,16 @@ __global__ void topk_fp32_scan_partitions(
       reinterpret_cast<TwoStagePart*>(workspace) +
       static_cast<int64_t>(blockIdx.y) * gridDim.x + blockIdx.x;
   __shared__ uint32_t sample[Policy::kSamples];
-  __shared__ int hist[kRadix], thresholds[4], remain, counts[3];
-  if (tid < 3) counts[tid] = 0;
+  __shared__ int hist[kRadix], thresholds[4], remain;
+  __shared__ int strict_count, equal_count, has_nan;
+  if (tid == 0) strict_count = equal_count = has_nan = 0;
   for (int i = tid; i < Policy::kSamples; i += blockDim.x) {
     const int lo = static_cast<int64_t>(i) * width / Policy::kSamples;
-    if constexpr (!Policy::kJitter) {
-      sample[i] = ordered_key(row[lo]);
-    } else {
-      const int hi = static_cast<int64_t>(i + 1) * width / Policy::kSamples;
-      const uint32_t h = static_cast<uint32_t>(i) * 0x9e3779b9u;
-      const int offset =
-          static_cast<uint64_t>(h ^ (h >> 16)) * (hi - lo) >> 32;
-      sample[i] = ordered_key(row[lo + offset]);
-    }
+    const int hi = static_cast<int64_t>(i + 1) * width / Policy::kSamples;
+    const uint32_t h = static_cast<uint32_t>(i) * 0x9e3779b9u;
+    const int offset =
+        static_cast<uint64_t>(h ^ (h >> 16)) * (hi - lo) >> 32;
+    sample[i] = ordered_key(row[lo + offset]);
   }
   __syncthreads();
 
@@ -2292,15 +2292,11 @@ __global__ void topk_fp32_scan_partitions(
       (thresholds[2] << 16) | (thresholds[1] << 8) | thresholds[0];
 
   const uint32_t lanes_before = (1u << (tid & 31)) - 1;
-  const auto reserve = [&](uint32_t mask, int* count) {
-    return warp_lane0_atomic_add(count, __popc(mask)) +
-           __popc(mask & lanes_before);
-  };
   const auto collect = [&](int col, uint32_t key, bool valid) {
     const bool nan = valid && is_nan_ordered_key(key);
     const bool strict = valid && !nan && key > pivot;
     const bool equal = valid && key == pivot;
-    if (nan) atomicOr(counts + 2, 1);
+    if (nan) atomicOr(&has_nan, 1);
 
     const uint32_t hits = __ballot_sync(
         0xffffffffu, Policy::kPrecheck ? (strict || equal) : strict);
@@ -2311,25 +2307,28 @@ __global__ void topk_fp32_scan_partitions(
     const uint32_t strict_mask =
         Policy::kPrecheck ? (hits & ~equal_mask) : hits;
     if (strict_mask) {
-      const int pos = reserve(strict_mask, counts);
+      const int pos = warp_reserve(&strict_count, strict_mask, lanes_before);
       if (strict && pos < kTwoStageCapacity) {
         part->strict_cols[pos] = col;
         part->strict_keys[pos] = key;
       }
     }
     if (equal_mask) {
-      const int pos = reserve(equal_mask, counts + 1);
+      const int pos = warp_reserve(&equal_count, equal_mask, lanes_before);
       if (equal && pos < kTwoStageCapacity) part->equal_cols[pos] = col;
     }
   };
   const int vecs = width / 4;
-  const int begin = vecs * blockIdx.x / gridDim.x;
-  const int end = vecs * (blockIdx.x + 1) / gridDim.x;
   const bool aligned = (reinterpret_cast<uintptr_t>(row) & 15) == 0;
-  for (int base = begin; base < end; base += blockDim.x) {
-    const int i = base + tid;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const int warps = blockDim.x >> 5;
+  for (int tile = blockIdx.x * warps + warp; tile * 32 < vecs;
+       tile += gridDim.x * warps) {
+    const int i = tile * 32 + lane;
+    const bool in_bounds = i < vecs;
     Floatx4 v{};
-    if (i < end) {
+    if (in_bounds) {
       if (aligned) v = load_floatx4(row + 4 * i);
       else for (int j = 0; j < 4; ++j) v.values[j] = row[4 * i + j];
     }
@@ -2344,18 +2343,18 @@ __global__ void topk_fp32_scan_partitions(
     }
     bool run_warp = true;
     if constexpr (Policy::kPrecheck) {
-      run_warp = __ballot_sync(0xffffffffu, i < end && any) != 0;
+      run_warp = __ballot_sync(0xffffffffu, in_bounds && any) != 0;
     }
     if (run_warp) {
       #pragma unroll
-      for (int j = 0; j < 4; ++j) collect(4 * i + j, keys[j], i < end);
+      for (int j = 0; j < 4; ++j) collect(4 * i + j, keys[j], in_bounds);
     }
   }
   __syncthreads();
   if (tid == 0) {
-    part->strict_count = counts[0];
-    part->equal_count = counts[1];
-    part->has_nan = counts[2];
+    part->strict_count = strict_count;
+    part->equal_count = equal_count;
+    part->has_nan = has_nan;
   }
 }
 
@@ -2475,9 +2474,7 @@ __global__ void topk_fp32_finish_partitions(
       const uint32_t strict_mask =
           __ballot_sync(0xffffffffu, valid && key > prefix);
       if (strict_mask) {
-        const int pos =
-            warp_lane0_atomic_add(&output_count, __popc(strict_mask)) +
-            __popc(strict_mask & lanes_before);
+        const int pos = warp_reserve(&output_count, strict_mask, lanes_before);
         if (valid && key > prefix) {
           store_topk_result(
               indices, row_values, values != nullptr, pos, col,
@@ -2567,9 +2564,8 @@ void launch_topk_fp32_two_stage(
   const bool return_value = output_value.has_value();
   TORCH_CHECK(input.device().type() == c10::DeviceType::PrivateUse1 &&
                   input.dim() == 2 && input.scalar_type() == at::kFloat &&
-                  input.stride(1) == 1 &&
-                  input.size(1) >= TwoStageSmallPolicy::kSamples &&
-                  input.size(1) % 4 == 0 && input.size(1) < (1 << 23),
+                  input.stride(1) == 1 && input.size(1) % 4 == 0 &&
+                  input.size(1) < (1 << 23),
               "invalid two-stage input");
   TORCH_CHECK(output.dim() == 2 && output.size(0) == input.size(0) &&
                   output.size(1) > 0 && output.size(1) <= kTwoStageMaxTopK &&
@@ -2577,6 +2573,13 @@ void launch_topk_fp32_two_stage(
                   (output.scalar_type() == at::kLong || output.scalar_type() == at::kInt) &&
                   output.device() == input.device(),
               "invalid two-stage indices");
+  const int64_t topk = output.size(1);
+  const int min_samples = topk > kTwoStageMedTopK
+                              ? TwoStageLargePolicy::kSamples
+                              : (topk > kTwoStageSmallTopK
+                                     ? TwoStageMedPolicy::kSamples
+                                     : TwoStageSmallPolicy::kSamples);
+  TORCH_CHECK(input.size(1) >= min_samples, "invalid two-stage input");
   TORCH_CHECK(scratch.scalar_type() == at::kInt && scratch.is_contiguous() &&
                   scratch.device() == input.device() &&
                   scratch.numel() >= two_stage_scratch_ints(input.size(0), parts),

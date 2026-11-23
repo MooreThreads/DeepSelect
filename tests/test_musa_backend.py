@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import os
 import subprocess
 import sys
+import unittest.mock
 
 import torch
 import torch_musa  # noqa: F401
 
 import deep_select
-from deep_select import deep_select_musa
+from deep_select import deep_select_musa, musa_cpp
 import kernelkit as kk
 
 from lib import (
@@ -482,11 +484,55 @@ def _check_fp32_two_stage(
             assert vals is None
 
 
+def _check_fp32_two_stage_modes(
+    x: torch.Tensor, ks: tuple[int, ...]
+) -> None:
+    for k in ks:
+        for sorted_value, return_value, indices_type in (
+            (True, True, torch.int32),
+            (False, False, torch.int64),
+        ):
+            _check_fp32_two_stage(
+                x,
+                k,
+                sorted_value=sorted_value,
+                return_value=return_value,
+                indices_type=indices_type,
+            )
+
+
+@contextmanager
+def _forbid_fp32_two_stage_kernel():
+    real_module = musa_cpp._module()
+
+    def _unexpected(*args, **kwargs):
+        raise AssertionError("topk_fp32_two_stage should not be called")
+
+    class _NoTwoStageModule:
+        def __getattr__(self, name: str):
+            if name == "topk_fp32_two_stage":
+                return _unexpected
+            return getattr(real_module, name)
+
+    with unittest.mock.patch.object(
+        musa_cpp, "_module", return_value=_NoTwoStageModule()
+    ):
+        yield
+
+
 def _run_fp32_two_stage_cases() -> None:
     prior = os.environ.get("DEEP_SELECT_MUSA_FP32_TWO_STAGE")
     os.environ.pop("DEEP_SELECT_MUSA_FP32_TWO_STAGE", None)
     width = 262144
     try:
+        default_off_x = torch.randn(
+            6, width, dtype=torch.float32, device="musa"
+        )
+        with _forbid_fp32_two_stage_kernel():
+            _check_fp32_two_stage_modes(default_off_x, (128, 512, 1024, 2048))
+        del default_off_x
+
+        os.environ["DEEP_SELECT_MUSA_FP32_TWO_STAGE"] = "1"
         for rows in (1, 6, 16):
             x = torch.randn(rows, width, dtype=torch.float32, device="musa")
             for k in (128, 512, 1024, 2048):
@@ -505,63 +551,25 @@ def _run_fp32_two_stage_cases() -> None:
                         )
             del x
 
+        wide_x = torch.randn(6, 524288, dtype=torch.float32, device="musa")
+        _check_fp32_two_stage_modes(wide_x, (512, 2048))
+        del wide_x
+
         all_equal = torch.full((6, width), 2.0, dtype=torch.float32, device="musa")
-        for k in (512, 1024, 2048):
-            _check_fp32_two_stage(
-                all_equal,
-                k,
-                sorted_value=False,
-                return_value=False,
-                indices_type=torch.int32,
-            )
-            _check_fp32_two_stage(
-                all_equal,
-                k,
-                sorted_value=True,
-                return_value=True,
-                indices_type=torch.int64,
-            )
+        _check_fp32_two_stage_modes(all_equal, (512, 1024, 2048))
         del all_equal
 
         ties = torch.full((6, width), -1.0, dtype=torch.float32, device="musa")
         ties[:, :200] = 5.0
         ties[:, 200:5000] = 1.0
-        for k in (512, 1024, 2048):
-            _check_fp32_two_stage(
-                ties,
-                k,
-                sorted_value=True,
-                return_value=True,
-                indices_type=torch.int32,
-            )
-            _check_fp32_two_stage(
-                ties,
-                k,
-                sorted_value=False,
-                return_value=False,
-                indices_type=torch.int64,
-            )
+        _check_fp32_two_stage_modes(ties, (512, 1024, 2048))
         del ties
 
         adversarial = torch.zeros(6, width, dtype=torch.float32, device="musa")
         adversarial[:, 1:2001:2] = torch.linspace(
             1.0, 2.0, 1000, dtype=torch.float32, device="musa"
         )
-        for k in (128, 512, 1024, 2048):
-            _check_fp32_two_stage(
-                adversarial,
-                k,
-                sorted_value=True,
-                return_value=True,
-                indices_type=torch.int32,
-            )
-            _check_fp32_two_stage(
-                adversarial,
-                k,
-                sorted_value=False,
-                return_value=False,
-                indices_type=torch.int64,
-            )
+        _check_fp32_two_stage_modes(adversarial, (128, 512, 1024, 2048))
         del adversarial
 
         periodic = torch.zeros(6, width, dtype=torch.float32, device="musa")
@@ -575,21 +583,7 @@ def _run_fp32_two_stage_cases() -> None:
         periodic[:, 3::step] = torch.linspace(
             3.0, 4.0, width // step, dtype=torch.float32, device="musa"
         )
-        for k in (128, 512, 1024, 2048):
-            _check_fp32_two_stage(
-                periodic,
-                k,
-                sorted_value=True,
-                return_value=True,
-                indices_type=torch.int32,
-            )
-            _check_fp32_two_stage(
-                periodic,
-                k,
-                sorted_value=False,
-                return_value=False,
-                indices_type=torch.int64,
-            )
+        _check_fp32_two_stage_modes(periodic, (128, 512, 1024, 2048))
         del periodic
 
         nan_x = torch.randn(6, width, dtype=torch.float32, device="musa")
@@ -608,7 +602,7 @@ def _run_fp32_two_stage_cases() -> None:
                     assert torch.all(nan_idxs[:, 0] == 0x3F3F3F3F).item()
         del nan_x
 
-        for rows, k in ((6, 512), (16, 1024)):
+        for rows, k in ((6, 512), (16, 1024), (6, 2048)):
             gx = torch.randn(rows, width, dtype=torch.float32, device="musa")
             gout = torch.empty(rows, k, dtype=torch.int32, device="musa")
             captured: list[tuple[torch.Tensor | None, torch.Tensor]] = []
@@ -664,23 +658,20 @@ def _run_fp32_two_stage_cases() -> None:
                 atol=0,
             )
 
+        mp32_x = torch.randn(6, width, dtype=torch.float32, device="musa")
+        with (
+            unittest.mock.patch.object(
+                musa_cpp, "_device_capability", return_value=(3, 2)
+            ),
+            _forbid_fp32_two_stage_kernel(),
+        ):
+            _check_fp32_two_stage_modes(mp32_x, (128, 512, 1024, 2048))
+        del mp32_x
+
         os.environ["DEEP_SELECT_MUSA_FP32_TWO_STAGE"] = "0"
         opt_out_x = torch.randn(6, width, dtype=torch.float32, device="musa")
-        for k in (128, 512, 1024, 2048):
-            _check_fp32_two_stage(
-                opt_out_x,
-                k,
-                sorted_value=True,
-                return_value=True,
-                indices_type=torch.int32,
-            )
-            _check_fp32_two_stage(
-                opt_out_x,
-                k,
-                sorted_value=False,
-                return_value=False,
-                indices_type=torch.int64,
-            )
+        with _forbid_fp32_two_stage_kernel():
+            _check_fp32_two_stage_modes(opt_out_x, (128, 512, 1024, 2048))
         del opt_out_x
     finally:
         if prior is None:
@@ -1045,14 +1036,23 @@ torch.musa.synchronize()
 print("NO_DEVICE_TRAP", flush=True)
 """
     cases = (
-        ("bf16-single", "bfloat16", 4, 32768),
-        ("bf16-multi", "bfloat16", 1, 131072),
-        ("fp32-single", "float32", 4, 32768),
-        ("fp32-two-stage", "float32", 2, 262144),
+        ("bf16-single", "bfloat16", 4, 32768, {}),
+        ("bf16-multi", "bfloat16", 1, 131072, {}),
+        ("fp32-single", "float32", 4, 32768, {}),
+        (
+            "fp32-two-stage",
+            "float32",
+            2,
+            262144,
+            {"DEEP_SELECT_MUSA_FP32_TWO_STAGE": "1"},
+        ),
     )
-    for name, dtype, batch, width in cases:
+    for name, dtype, batch, width, extra_env in cases:
+        env = os.environ.copy()
+        env.update(extra_env)
         completed = subprocess.run(
             [sys.executable, "-c", probe, dtype, str(batch), str(width)],
+            env=env,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,

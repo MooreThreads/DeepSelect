@@ -177,12 +177,14 @@ CUDA and MUSA skip NaN checking for rows whose valid length is `<= topk`.
 
 ### MUSA FP32 two-stage dispatch
 
-The two-stage selector is enabled by default on MP31 for contiguous FP32 input
-without `end`, 1 to 16 rows, widths from 262144 to 524288 divisible by four, and
-`topk` from 128 to 2048. Results with `topk > 1024` use the existing value sort
-when requested. Set `DEEP_SELECT_MUSA_FP32_TWO_STAGE=0` to disable it and fall
-back to the existing dispatch. NaN rows produce the row sentinel and return
-early after the partition scan without taking the fallback path.
+Set `DEEP_SELECT_MUSA_FP32_TWO_STAGE=1` to opt in to the two-stage selector
+(off by default). When enabled on MP31 `(3, 1)`, it handles contiguous FP32
+inputs without `end`, 1 to 16 rows, widths from 262144 to 524288 divisible by
+four, and `topk` from 128 to 2048 (`topk > 1024` uses the existing value sort
+when requested). The partition scan uses cyclic 128-element warp-tile
+partitioning with unified deferred `compact12` fallback when a partition
+overflows, while NaN rows produce the row sentinel and return early after the
+partition scan without taking the fallback path.
 
 ## Citation
 
