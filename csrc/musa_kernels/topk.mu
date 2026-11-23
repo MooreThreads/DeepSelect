@@ -2235,22 +2235,21 @@ constexpr int kTwoStageWords =
     static_cast<int>(sizeof(TwoStagePart) / sizeof(int));
 
 template <int kSamplesVal, int kFinishCapacityVal, bool kJitterVal,
-          bool kPrecheckVal, bool kDeferFallbackVal, bool kAllowFusedSortVal>
+          bool kPrecheckVal, bool kAllowFusedSortVal, int kSigmaTenthsVal>
 struct TwoStagePolicy {
   static constexpr int kSamples = kSamplesVal;
   static constexpr int kFinishCapacity = kFinishCapacityVal;
   static constexpr bool kJitter = kJitterVal;
   static constexpr bool kPrecheck = kPrecheckVal;
-  static constexpr bool kDeferFallback = kDeferFallbackVal;
   static constexpr bool kAllowFusedSort = kAllowFusedSortVal;
-  static constexpr float kSigma = kJitterVal ? 3.5f : 2.5f;
+  static constexpr float kSigma = static_cast<float>(kSigmaTenthsVal) * 0.1f;
 };
 
 using TwoStageSmallPolicy =
-    TwoStagePolicy<2048, 4096, false, false, false, true>;
-using TwoStageMedPolicy = TwoStagePolicy<4096, 8192, true, true, true, true>;
+    TwoStagePolicy<2048, 4096, true, false, true, 25>;
+using TwoStageMedPolicy = TwoStagePolicy<4096, 8192, true, true, true, 35>;
 using TwoStageLargePolicy =
-    TwoStagePolicy<8192, 8192, true, true, true, false>;
+    TwoStagePolicy<8192, 8192, true, true, false, 35>;
 
 template <typename Policy>
 __global__ void topk_fp32_scan_partitions(
@@ -2409,16 +2408,12 @@ __global__ void topk_fp32_finish_partitions(
     if (tid == 0) indices[0] = static_cast<OutIndexT>(kNanSentinel);
     return;
   }
-  if constexpr (Policy::kDeferFallback) {
-    if (exact_full) {
-      if (tid == 0) indices[0] = static_cast<OutIndexT>(kSampleFallbackSentinel);
-      return;
-    }
+  if (exact_full) {
+    if (tid == 0) indices[0] = static_cast<OutIndexT>(kSampleFallbackSentinel);
+    return;
   }
 
-  constexpr bool kInlineFallback = !Policy::kDeferFallback;
-  const bool run_full = kInlineFallback && exact_full;
-  const int count = run_full ? width : offsets[parts];
+  const int count = offsets[parts];
 
   if (fill_ties) {
     for (int p = 0; p < parts; ++p) {
@@ -2445,23 +2440,20 @@ __global__ void topk_fp32_finish_partitions(
       }
     }
   } else {
-    if (!run_full) {
-      for (int p = 0; p < parts; ++p) {
-        const TwoStagePart& part = row_parts[p];
-        for (int i = offsets[p] + tid; i < offsets[p + 1]; i += blockDim.x) {
-          const int slot = i - offsets[p];
-          storage.sel.cols[i] = part.strict_cols[slot];
-          storage.sel.keys[i] = part.strict_keys[slot];
-        }
+    for (int p = 0; p < parts; ++p) {
+      const TwoStagePart& part = row_parts[p];
+      for (int i = offsets[p] + tid; i < offsets[p + 1]; i += blockDim.x) {
+        const int slot = i - offsets[p];
+        storage.sel.cols[i] = part.strict_cols[slot];
+        storage.sel.keys[i] = part.strict_keys[slot];
       }
-      __syncthreads();
     }
+    __syncthreads();
     uint32_t prefix = 0;
     uint32_t mask = 0;
     for (int byte = 3; byte >= 0; --byte) {
       for (int i = tid; i < count; i += blockDim.x) {
-        const uint32_t key =
-            run_full ? ordered_key(row[i]) : storage.sel.keys[i];
+        const uint32_t key = storage.sel.keys[i];
         if ((key & mask) == prefix)
           atomicAdd(storage.sel.hist + ((key >> (8 * byte)) & 255), 1);
       }
@@ -2478,9 +2470,8 @@ __global__ void topk_fp32_finish_partitions(
     for (int round = 0; round < rounds; ++round) {
       const int i = round * blockDim.x + tid;
       const bool valid = i < count;
-      const int col = run_full ? i : (valid ? storage.sel.cols[i] : 0);
-      const uint32_t key =
-          valid ? (run_full ? ordered_key(row[col]) : storage.sel.keys[i]) : 0;
+      const int col = valid ? storage.sel.cols[i] : 0;
+      const uint32_t key = valid ? storage.sel.keys[i] : 0;
       const uint32_t strict_mask =
           __ballot_sync(0xffffffffu, valid && key > prefix);
       if (strict_mask) {
@@ -2490,8 +2481,7 @@ __global__ void topk_fp32_finish_partitions(
         if (valid && key > prefix) {
           store_topk_result(
               indices, row_values, values != nullptr, pos, col,
-              values ? (run_full ? row[col] : value_from_ordered_key(key))
-                     : 0.0f);
+              values ? value_from_ordered_key(key) : 0.0f);
         }
       }
       const uint32_t equal_mask =
@@ -2503,8 +2493,7 @@ __global__ void topk_fp32_finish_partitions(
           if (pos < topk) {
             store_topk_result(
                 indices, row_values, values != nullptr, pos, col,
-                values ? (run_full ? row[col] : value_from_ordered_key(key))
-                       : 0.0f);
+                values ? value_from_ordered_key(key) : 0.0f);
           }
         }
       }
@@ -2542,13 +2531,11 @@ void launch_two_stage_partitions(
           input.data_ptr<float>(), input.size(1), input.stride(0), indices,
           output.stride(0), values, value_stride, topk, sort_by_value,
           workspace, parts);
-  if constexpr (Policy::kDeferFallback) {
-    topk_fp32_compact12_kernel<1024, 4096, OutIndexT, false, true>
-        <<<rows, 1024, 0, stream>>>(
-            input.data_ptr<float>(), indices, input.size(1), input.stride(0),
-            output.stride(0), values, value_stride, nullptr, OutIndexT{0}, 0.0f,
-            topk, values != nullptr, sort_by_value);
-  }
+  topk_fp32_compact12_kernel<1024, 4096, OutIndexT, false, true>
+      <<<rows, 1024, 0, stream>>>(
+          input.data_ptr<float>(), indices, input.size(1), input.stride(0),
+          output.stride(0), values, value_stride, nullptr, OutIndexT{0}, 0.0f,
+          topk, values != nullptr, sort_by_value);
   if (abort_when_nan_found) launch_nan_guard(indices, rows, output.stride(0), stream);
 }
 

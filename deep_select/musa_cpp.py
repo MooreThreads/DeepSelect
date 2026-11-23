@@ -210,7 +210,7 @@ def launch_topk_fp32(
     rows, width = input.shape
     topk = output.shape[1]
     if (
-        os.getenv("DEEP_SELECT_MUSA_FP32_TWO_STAGE") == "1"
+        os.getenv("DEEP_SELECT_MUSA_FP32_TWO_STAGE", "1") != "0"
         and end is None
         and 0 < rows <= 16
         and 262144 <= width <= 524288

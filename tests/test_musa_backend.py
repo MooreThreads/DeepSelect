@@ -484,7 +484,7 @@ def _check_fp32_two_stage(
 
 def _run_fp32_two_stage_cases() -> None:
     prior = os.environ.get("DEEP_SELECT_MUSA_FP32_TWO_STAGE")
-    os.environ["DEEP_SELECT_MUSA_FP32_TWO_STAGE"] = "1"
+    os.environ.pop("DEEP_SELECT_MUSA_FP32_TWO_STAGE", None)
     width = 262144
     try:
         for rows in (1, 6, 16):
@@ -543,26 +543,54 @@ def _run_fp32_two_stage_cases() -> None:
             )
         del ties
 
-        overflow = torch.zeros(6, width, dtype=torch.float32, device="musa")
-        overflow[:, :900] = torch.linspace(
-            1.0, 2.0, 900, dtype=torch.float32, device="musa"
+        adversarial = torch.zeros(6, width, dtype=torch.float32, device="musa")
+        adversarial[:, 1:2001:2] = torch.linspace(
+            1.0, 2.0, 1000, dtype=torch.float32, device="musa"
         )
-        for k in (512, 1024, 2048):
+        for k in (128, 512, 1024, 2048):
             _check_fp32_two_stage(
-                overflow,
+                adversarial,
                 k,
                 sorted_value=True,
                 return_value=True,
                 indices_type=torch.int32,
             )
             _check_fp32_two_stage(
-                overflow,
+                adversarial,
                 k,
                 sorted_value=False,
-                return_value=True,
+                return_value=False,
                 indices_type=torch.int64,
             )
-        del overflow
+        del adversarial
+
+        periodic = torch.zeros(6, width, dtype=torch.float32, device="musa")
+        step = width // 2048
+        periodic[:, 1::step] = torch.linspace(
+            1.0, 2.0, width // step, dtype=torch.float32, device="musa"
+        )
+        periodic[:, 2::step] = torch.linspace(
+            2.0, 3.0, width // step, dtype=torch.float32, device="musa"
+        )
+        periodic[:, 3::step] = torch.linspace(
+            3.0, 4.0, width // step, dtype=torch.float32, device="musa"
+        )
+        for k in (128, 512, 1024, 2048):
+            _check_fp32_two_stage(
+                periodic,
+                k,
+                sorted_value=True,
+                return_value=True,
+                indices_type=torch.int32,
+            )
+            _check_fp32_two_stage(
+                periodic,
+                k,
+                sorted_value=False,
+                return_value=False,
+                indices_type=torch.int64,
+            )
+        del periodic
 
         nan_x = torch.randn(6, width, dtype=torch.float32, device="musa")
         nan_x[:, 17] = float("nan")
@@ -635,6 +663,25 @@ def _run_fp32_two_stage_cases() -> None:
                 rtol=0,
                 atol=0,
             )
+
+        os.environ["DEEP_SELECT_MUSA_FP32_TWO_STAGE"] = "0"
+        opt_out_x = torch.randn(6, width, dtype=torch.float32, device="musa")
+        for k in (128, 512, 1024, 2048):
+            _check_fp32_two_stage(
+                opt_out_x,
+                k,
+                sorted_value=True,
+                return_value=True,
+                indices_type=torch.int32,
+            )
+            _check_fp32_two_stage(
+                opt_out_x,
+                k,
+                sorted_value=False,
+                return_value=False,
+                indices_type=torch.int64,
+            )
+        del opt_out_x
     finally:
         if prior is None:
             os.environ.pop("DEEP_SELECT_MUSA_FP32_TWO_STAGE", None)
@@ -1001,6 +1048,7 @@ print("NO_DEVICE_TRAP", flush=True)
         ("bf16-single", "bfloat16", 4, 32768),
         ("bf16-multi", "bfloat16", 1, 131072),
         ("fp32-single", "float32", 4, 32768),
+        ("fp32-two-stage", "float32", 2, 262144),
     )
     for name, dtype, batch, width in cases:
         completed = subprocess.run(
@@ -1363,11 +1411,13 @@ def _run_kernelkit_profile_case() -> None:
     assert any(
         "partial_fp32_histogram_kernel" in name
         or "topk_fp32_compact12_kernel" in name
+        or "topk_fp32_scan_partitions" in name
         for name in fp32_kernel_names
     ), fp32_kernel_names
     assert any(
         "finish_fp32_multi_kernel" in name
         or "topk_fp32_compact12_kernel" in name
+        or "topk_fp32_finish_partitions" in name
         for name in fp32_kernel_names
     ), fp32_kernel_names
 
