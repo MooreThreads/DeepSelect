@@ -35,6 +35,11 @@ die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 for c in curl git python3 docker systemctl; do command -v "$c" >/dev/null || die "missing required command: $c"; done
 sudo -n true 2>/dev/null || die "passwordless sudo required for the systemd service; run 'sudo -v' first"
 
+if proxy=$(git config --global --get https.proxy 2>/dev/null) && [[ -n "$proxy" ]]; then
+  echo "WARNING: global git proxy is set to $proxy; if it is unreachable, actions/checkout will time out." >&2
+  echo "         Clear it for this host (back up ~/.gitconfig first): git config --global --unset http.proxy; git config --global --unset https.proxy" >&2
+fi
+
 log "fetching runner registration token for $REPO"
 TOKEN=$(curl -fsS -X POST \
   -H "Authorization: Bearer $GITHUB_PAT" \

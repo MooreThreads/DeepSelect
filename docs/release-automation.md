@@ -88,6 +88,22 @@ python -m deep_select.compat
   （不要上传到 PyPI，同名版本会被拒绝）；或后续新增 `deepselect-musa-torch<ver>` 独立包名。
 - 版本号一经 PyPI 发布不可覆盖/删除重传；修复只能升版本。
 
+## 故障排查
+
+- **构建任务卡在 `actions/checkout` / `Failed to connect to 192.168.x.x:8888`**
+  构建机 `~/.gitconfig` 里残留了不可达的代理，checkout 继承了它。
+  处理（先备份 `~/.gitconfig`）：
+  ```bash
+  git config --global --unset http.proxy
+  git config --global --unset https.proxy
+  sudo systemctl restart actions.runner.MooreThreads-DeepSelect.ds-musa-s5000-1.service
+  ```
+  也可以为 runner 单独覆盖 `GIT_CONFIG_GLOBAL` 到干净文件（systemd drop-in）。
+- **`invalid-publisher`（PyPI）**：pending publisher 的 Owner/Repository/workflow/environment 与
+  workflow 的 OIDC claims 不一致；按本文件“一次性配置”表逐项核对后重新运行 `publish-pypi`。
+- **tag 已存在但 PyPI 没发**：版本号没变不会再触发 release；手动运行 `publish-pypi` 指定该 tag。
+- **想发同一个版本的新构建**：PyPI 不允许覆盖；必须升版本号。
+
 ## 安全注意事项
 
 - self-hosted runner 只应在 **main push / workflow_dispatch** 的发布流程中使用；
