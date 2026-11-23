@@ -1,0 +1,63 @@
+name: publish-pypi
+
+# Publish an already-built deepselect-musa wheel to PyPI using Trusted
+# Publishing (GitHub OIDC) - no PyPI token is stored in this repository.
+#
+# PyPI pending publisher must be configured with:
+#   project: deepselect-musa
+#   owner: MooreThreads
+#   repository: DeepSelect
+#   workflow: publish-pypi.yml
+#   environment: pypi
+#
+# The wheel is taken from the GitHub Release asset (the MUSA build is done on
+# MUSA hardware, not on GitHub-hosted runners).
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "GitHub Release tag containing the deepselect_musa wheel (e.g. v0.0.1)"
+        required: true
+        default: "v0.0.1"
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    name: publish wheel to PyPI
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/deepselect-musa
+    steps:
+      - name: Resolve release tag
+        id: rel
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "release" ]; then
+            echo "tag=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download wheel from the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          gh release download "${{ steps.rel.outputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --pattern "deepselect_musa-*.whl" \
+            --dir dist
+          ls -l dist
+
+      - name: Publish to PyPI (Trusted Publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
