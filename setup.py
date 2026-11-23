@@ -355,7 +355,7 @@ setup(
     classifiers=[
         "Programming Language :: Python :: 3",
         "Operating System :: POSIX :: Linux",
-        "Environment :: GPU :: MTHREADS MUSA",
+        "Environment :: GPU",
         "Topic :: Scientific/Engineering :: Artificial Intelligence",
     ],
 )
