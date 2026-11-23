@@ -45,6 +45,12 @@ jobs:
             echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Check out repository helper scripts
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/ci/musa
+          sparse-checkout-cone-mode: false
+
       - name: Download wheel from the GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -55,6 +61,17 @@ jobs:
             --repo "${{ github.repository }}" \
             --pattern "deepselect_musa-*.whl" \
             --dir dist
+          ls -l dist
+
+      - name: Retag wheel for PyPI (manylinux)
+        run: |
+          set -euo pipefail
+          # PyPI rejects the generic linux_x86_64 wheel tag; rewrite it to the
+          # glibc baseline of the supported MUSA runtime (Ubuntu 22.04).
+          python3 scripts/ci/musa/retag_manylinux.py \
+            --wheel dist/deepselect_musa-*.whl \
+            --platform-tag manylinux_2_35_x86_64 \
+            --remove
           ls -l dist
 
       - name: Publish to PyPI (Trusted Publishing)
