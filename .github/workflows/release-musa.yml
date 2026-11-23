@@ -3,8 +3,10 @@ name: release-musa
 # 设计草案（v0.2，基于 2026-11-20 mccx-204 spike 的实测配方）。
 # 名字、路径、secrets 以仓库实际为准。
 #
-# 触发：手工 workflow_dispatch（推荐，torchada 式小步发布）或 push tag v*。
-# 安全：自托管 runner 只接 tag/dispatch；PR 不发这里（见 DESIGN.md §6.2）。
+# 触发：仅手工 workflow_dispatch（旧的发布流程保留作兜底）。
+# 日常发版请走 release-musa-auto.yml：改 deep_select/__version__.py 后 push 即自动构建、
+# 测试、建 release 并触发 PyPI 发布。
+# 安全：自托管 runner 只接 dispatch；PR 不发这里（见 DESIGN.md §6.2）。
 on:
   workflow_dispatch:
     inputs:
@@ -16,9 +18,6 @@ on:
         description: "要发布的 git ref/SHA（默认当前分支 HEAD）"
         required: false
         type: string
-  push:
-    tags:
-      - "v*"
 
 permissions:
   contents: read

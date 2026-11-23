@@ -3,6 +3,7 @@
 ## 0.0.1 — 2026-11-20
 
 First `deepselect-musa` release line (MUSA backend packaging + short BF16 topk).
+Published to PyPI as `deepselect-musa==0.0.1` (`cp310` / `manylinux_2_35_x86_64`).
 
 ### Added
 - **MUSA backend**: AOT `.mu` TopK kernels for BF16/FP32, public `deep_select.topk`

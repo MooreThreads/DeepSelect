@@ -105,13 +105,23 @@ pip install -v .
 ```
 
 For MUSA, prebuilt wheels for the supported stack (MUSA SDK 5.2,
-`torch`/`torch_musa` 2.11.0.post1, Python 3.10) are published through the
-DeepSelect wheel index:
+`torch`/`torch_musa` 2.11.0.post1, Python 3.10, x86_64 with glibc >= 2.35) are
+published on PyPI:
 
 ```bash
-pip install --index-url https://moorethreads.github.io/deepselect-whl/musa52-torch211/ \
-  "deepselect-musa==0.0.1+musa5.2.0torch2.11.0.post1"
+pip install deepselect-musa
+# or pin the exact release:
+# pip install "deepselect-musa==0.0.1"
 python -m deep_select.compat
+```
+
+The wheel carries build metadata and `python -m deep_select.compat` checks the
+runtime torch/musa stack. Exact-version wheels are also attached to
+[GitHub Releases](https://github.com/MooreThreads/DeepSelect/releases) if you
+need to install without an index:
+
+```bash
+pip install https://github.com/MooreThreads/DeepSelect/releases/download/v0.0.1/deepselect_musa-0.0.1-cp310-cp310-linux_x86_64.whl
 ```
 
 To build the native MUSA extension from source instead:

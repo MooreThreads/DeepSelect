@@ -78,6 +78,14 @@ python -m deep_select.compat
   Actions → `publish-pypi` → Run workflow → 填入 `tag`（如 `v0.0.2`）
 - 重跑失败任务：直接 Re-run；若 tag 已创建但 PyPI 未发布，用上面的 `publish-pypi` 手动补发。
 
+## PyPI 平台 tag
+
+PyPI 拒绝通用的 `linux_x86_64` wheel tag。构建机仍产出 `linux_x86_64` wheel
+（GitHub Release 直链安装用），`publish-pypi.yml` 在上传前调用
+`scripts/ci/musa/retag_manylinux.py` 把文件名/`WHEEL` tag 改写为
+`manylinux_2_35_x86_64`（当前 MUSA 运行环境 glibc 基线）并重算 `RECORD`，
+再用 Trusted Publishing 上传。
+
 ## 版本与平台约定
 
 - **PyPI 只接受 public version**（不能用 `+musa5.2.0torch2.11.0.post1` 这类 local version）。
