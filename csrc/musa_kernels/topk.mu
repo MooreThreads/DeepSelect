@@ -4369,6 +4369,7 @@ void launch_topk_bf16_persist(const at::Tensor& input, at::Tensor& output,
 
 }  // namespace
 
+#ifndef DEEP_SELECT_DISABLE_PYBIND
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def("topk_bf16", &launch_topk_bf16, "DeepSelect BF16 MUSA topk");
   module.def("topk_fp32", &launch_topk_fp32, "DeepSelect FP32 MUSA topk");
@@ -4393,3 +4394,4 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def("persist_scratch_ints", &persist_scratch_ints,
              "DeepSelect BF16 persistent-grid scratch size in int32 words");
 }
+#endif

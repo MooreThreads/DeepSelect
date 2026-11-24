@@ -291,9 +291,11 @@ def build_on_musa_platform():
     from torch_musa.utils.musa_extension import BuildExtension, MUSAExtension
 
     this_dir = Path(__file__).resolve().parent
+    include_musa_api = os.environ.get("DEEP_SELECT_INCLUDE_MUSA_API", "0") == "1"
+    musa_source = "musa_api.mu" if include_musa_api else "musa_kernels/topk.mu"
     extension = MUSAExtension(
         name="deep_select.deep_select_musa_cpp",
-        sources=[str(this_dir / "csrc" / "musa_kernels" / "topk.mu")],
+        sources=[str(this_dir / "csrc" / musa_source)],
         include_dirs=[str(this_dir / "csrc" / "3rdparty" / "mutlass" / "include")],
         extra_compile_args={
             "cxx": ["-O3"],
