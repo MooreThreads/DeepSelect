@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.0.2 — 2026-11-25
+
+### Added
+- MUSA: register DeepSelect ops through the vLLM extension path (`csrc/musa_api.mu`),
+  while keeping standalone MUSA builds working via an explicit adapter source flag.
+
+### Changed
+- PyPI: `deepselect-musa` 0.0.1 is now installable from PyPI; 0.0.2 continues the
+  published MUSA release line (`cp310` / `manylinux_2_35_x86_64`, MUSA SDK 5.2,
+  torch/torch_musa 2.11.0.post1).
+- Release automation: `release-musa-auto.yml` builds/tests on a MUSA runner on
+  version bumps, creates the GitHub Release, and triggers Trusted Publishing to PyPI.
+
 ## 0.0.1 — 2026-11-20
 
 First `deepselect-musa` release line (MUSA backend packaging + short BF16 topk).
