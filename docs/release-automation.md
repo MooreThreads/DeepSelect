@@ -118,3 +118,31 @@ PyPI 拒绝通用的 `linux_x86_64` wheel tag。构建机仍产出 `linux_x86_64
   不要给 `pull_request` 工作流配置该 runner（公开仓库的 fork PR 代码不应在构建机上执行）。
 - runner 以 `mccxadmin` + docker 组运行，能访问 MUSA 设备；机器本身应按内网可信环境管理。
 - PyPI Trusted Publishing 使用短时 OIDC token，仓库不需要也没有保存 PyPI token。
+
+## Runner 不可用时的兜底发布（手动）
+
+如果 self-hosted MUSA runner 所在机器临时不可达（`gh api repos/.../actions/runners`
+显示 offline，workflow 一直 queued）：
+
+1. 在任意可用的 **MUSA SDK 5.2 + torch_musa 2.11.0.post1 + Python 3.10** 环境构建：
+
+   ```bash
+   export DEEP_SELECT_VERSION=<X.Y.Z> DEEP_SELECT_PUBLIC_VERSION=<X.Y.Z> \
+          DEEP_SELECT_DIST_NAME=deepselect-musa
+   bash scripts/ci/musa/build_wheel.sh --src "$PWD" --out "$PWD/dist" --skip-src-setup
+   ```
+
+2. 本地 commit + push 版本号，创建 tag `v<X.Y.Z>` 与 GitHub Release（附件：`linux_x86_64`
+   wheel + `SHA256SUMS`）。可用 GitHub API/`gh release create`。
+3. 手动触发 PyPI 发布：
+
+   ```bash
+   gh workflow run publish-pypi.yml -f tag=v<X.Y.Z>
+   # 或 GitHub → Actions → publish-pypi → Run workflow
+   ```
+
+   它会把 wheel 重打成 `manylinux_2_35_x86_64` 并用 Trusted Publishing 上传。
+
+`release-musa-auto` 的 tag 幂等保护会让随后恢复的 runner 自动跳过旧版本，不会重复发布。
+runner 恢复后检查：`sudo systemctl status actions.runner.MooreThreads-DeepSelect.ds-musa-s5000-1.service`。
+

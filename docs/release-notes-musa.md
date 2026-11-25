@@ -1,3 +1,26 @@
+# DeepSelect MUSA 0.0.2
+
+## 安装
+
+```bash
+pip install "deepselect-musa==0.0.2"
+# 或升级：
+pip install -U deepselect-musa
+python -m deep_select.compat
+```
+
+PyPI wheel：`deepselect_musa-0.0.2-cp310-cp310-manylinux_2_35_x86_64.whl`。
+
+## 变更
+
+- MUSA：通过 vLLM extension 路径注册 DeepSelect ops（`csrc/musa_api.mu`），
+  同时保留独立 MUSA 构建（显式 adapter source flag）。
+- 发布链路：版本号变更驱动的自动构建/测试 → GitHub Release → PyPI Trusted Publishing。
+
+## 兼容性
+
+- MUSA SDK 5.2、`torch`/`torch_musa` 2.11.0.post1、Python 3.10、x86_64（glibc >= 2.35）、MTT S5000（`mp_31`）。
+
 # DeepSelect MUSA 0.0.1
 
 首个 `deepselect-musa` 发布线（MUSA 后端打包 + 短序列 BF16 TopK 优化）。
